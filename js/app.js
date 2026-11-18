@@ -1,0 +1,1248 @@
+/* Finance – Control de gastos de tarjetas (frontend estático para GitHub Pages) */
+(function () {
+  'use strict';
+
+  const CFG = window.FINANCE_CONFIG || {};
+  const PARAMS = new URLSearchParams(location.search);
+  const DEMO = PARAMS.has('demo');
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+  };
+  // La URL del backend NO va en el repositorio: se toma de js/config.local.js (local),
+  // o se captura una vez en la pantalla de acceso y se guarda en este navegador.
+  const validApi = u => /^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(String(u || '').trim());
+  function apiUrl() { return (CFG.API_URL || '').trim() || store.get('finance_api') || ''; }
+  const MESES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto',
+                 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+
+  const S = {
+    session: null,
+    cat: { tarjetas: [], responsables: [], categorias: [], limites: [], periodos: [] },
+    periodo: null,
+    tarjeta: '*',
+    data: { movimientos: [], asignaciones: [], estados: [] },
+    tab: null,
+    movFilter: { q: '', cat: '', resp: '', pendientes: false },
+    respFocus: '',
+    misCat: '',
+    fromResumen: false,
+    importRows: null,
+    importMeta: null,
+  };
+
+  /* ============================ Utilidades ============================ */
+
+  const $ = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const esc = s => String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const r2 = n => Math.round(Number(n || 0) * 100) / 100;
+  const money = new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'MXN' });
+  const fmt = n => money.format(r2(n));
+  const net = m => (m.tipo === 'devolucion' ? -1 : 1) * Number(m.monto);
+  const isActive = x => x.activo === true || String(x.activo).toLowerCase() === 'true' || x.activo === '';
+  const isAdmin = () => S.session && S.session.rol === 'admin';
+
+  function periodLabel(p) {
+    if (!p || p === '*') return 'Todos los periodos';
+    const [y, m] = String(p).split('-');
+    return MESES[Number(m) - 1] + ' ' + y;
+  }
+  function shiftPeriod(p, delta) {
+    let [y, m] = p.split('-').map(Number);
+    m += delta;
+    while (m < 1) { m += 12; y--; }
+    while (m > 12) { m -= 12; y++; }
+    return y + '-' + String(m).padStart(2, '0');
+  }
+  function currentPeriod() {
+    const d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+  }
+  function fmtDate(s) {
+    if (!s) return '';
+    const p = String(s).slice(0, 10).split('-');
+    return p.length === 3 ? p[2] + '/' + p[1] + '/' + p[0] : s;
+  }
+  function parseMSI(desc) {
+    const m = /\((\d{1,3}):(\d{1,3})\)/.exec(desc || '');
+    return m ? { actual: Number(m[1]), total: Number(m[2]) } : null;
+  }
+
+  function toast(msg, ms) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._h);
+    t._h = setTimeout(() => t.classList.remove('show'), ms || 2600);
+  }
+  function loading(on) { $('#loading').hidden = !on; }
+
+  /* ============================ API ============================ */
+
+  async function api(action, payload, opts) {
+    const body = Object.assign({ action: action, token: S.session && S.session.token }, payload || {});
+    if (!(opts && opts.silent)) loading(true);
+    try {
+      let res;
+      if (DEMO) {
+        res = await window.FinanceMock.call(body);
+      } else {
+        const r = await fetch(apiUrl(), {
+          method: 'POST',
+          // text/plain evita el preflight CORS con Apps Script
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(body),
+        });
+        res = await r.json();
+      }
+      if (!res.ok) {
+        if (res.error === 'SESSION') { logout(true); throw new Error('Tu sesión expiró, vuelve a entrar.'); }
+        throw new Error(res.error || 'Error');
+      }
+      return res.data;
+    } finally {
+      if (!(opts && opts.silent)) loading(false);
+    }
+  }
+
+  /* ============================ Datos derivados ============================ */
+
+  function asigOf(movId) { return S.data.asignaciones.filter(a => a.movimiento_id === movId); }
+  function asignado(m) { return r2(asigOf(m.id).reduce((s, a) => s + Number(a.monto), 0)); }
+  function pendiente(m) { return r2(Number(m.monto) - asignado(m)); }
+  function tarjetaTipo(nombre) {
+    const t = S.cat.tarjetas.find(x => x.nombre === nombre);
+    return t ? t.tipo : '';
+  }
+  function movsFiltradas() {
+    return S.data.movimientos
+      .filter(m => S.tarjeta === '*' || m.tarjeta === S.tarjeta)
+      .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
+  }
+  function limiteActual() {
+    const L = S.cat.limites;
+    const t = S.tarjeta;
+    const find = (p, c) => L.find(l => String(l.periodo) === p && String(l.tarjeta) === c);
+    const hit = find(S.periodo, t) || find('*', t);
+    return hit ? Number(hit.monto) : null;
+  }
+  function sumBy(items, keyFn, valFn) {
+    const out = {};
+    items.forEach(i => { const k = keyFn(i) || '(Sin asignar)'; out[k] = r2((out[k] || 0) + valFn(i)); });
+    return out;
+  }
+  function totalesPorResponsable(movs) {
+    const ids = {};
+    movs.forEach(m => { ids[m.id] = m; });
+    const out = {};
+    S.data.asignaciones.forEach(a => {
+      const m = ids[a.movimiento_id];
+      if (!m) return;
+      const sign = m.tipo === 'devolucion' ? -1 : 1;
+      out[a.responsable] = r2((out[a.responsable] || 0) + sign * Number(a.monto));
+    });
+    return out;
+  }
+  function limiteStatus(total, limite) {
+    if (!limite) return { cls: 'neutral', text: 'Sin límite definido', pct: 0 };
+    const pct = total / limite * 100;
+    if (pct > 100) return { cls: 'bad', text: '✕ Límite excedido por ' + fmt(total - limite), pct: pct };
+    if (pct >= 80) return { cls: 'warn', text: '! Cerca del límite · quedan ' + fmt(limite - total), pct: pct };
+    return { cls: 'good', text: '✓ Dentro del límite · quedan ' + fmt(limite - total), pct: pct };
+  }
+
+  /* ============================ Sesión ============================ */
+
+  function saveSession() {
+    try { localStorage.setItem('finance_session', JSON.stringify(S.session)); } catch (e) { /* ignore */ }
+  }
+  function loadSession() {
+    try { return JSON.parse(localStorage.getItem('finance_session') || 'null'); } catch (e) { return null; }
+  }
+  function logout(silent) {
+    if (!silent && S.session) api('logout', {}, { silent: true }).catch(() => {});
+    S.session = null;
+    try { localStorage.removeItem('finance_session'); } catch (e) { /* ignore */ }
+    $('#app-view').hidden = true;
+    $('#login-view').hidden = false;
+  }
+
+  async function onLogin(ev) {
+    ev.preventDefault();
+    const f = ev.target;
+    $('#login-error').textContent = '';
+    if (!DEMO && !(CFG.API_URL || '').trim()) {
+      const u = f.api.value.trim();
+      if (!validApi(u)) { $('#login-error').textContent = 'Captura la URL del servidor (https://script.google.com/macros/s/…/exec)'; $('#api-field').hidden = false; return; }
+      store.set('finance_api', u);
+    }
+    try {
+      S.session = await api('login', { usuario: f.usuario.value, password: f.password.value });
+      saveSession();
+      f.password.value = '';
+      await startApp();
+    } catch (e) {
+      $('#login-error').textContent = e.message;
+    }
+  }
+
+  async function startApp() {
+    const boot = await api('bootstrap');
+    S.cat = boot;
+    S.session = Object.assign(S.session, boot.session);
+    $('#login-view').hidden = true;
+    $('#app-view').hidden = false;
+    $('#user-name').textContent = S.session.usuario + (isAdmin() ? ' · admin' : ' · ' + S.session.responsable);
+    $('#user-avatar').textContent = String(S.session.responsable || S.session.usuario).charAt(0).toUpperCase();
+    if (!S.periodo) S.periodo = boot.periodos[0] || currentPeriod();
+    $('#f-periodo').value = S.periodo;
+    renderTarjetaFilter();
+    renderTabs();
+    await loadPeriodo();
+  }
+
+  function renderTarjetaFilter() {
+    const sel = $('#f-tarjeta');
+    sel.innerHTML = '<option value="*">Todas</option>' + S.cat.tarjetas.filter(isActive)
+      .map(t => `<option value="${esc(t.nombre)}">${esc(t.nombre)} (${t.tipo === 'credito' ? 'crédito' : 'débito'})</option>`).join('');
+    sel.value = S.tarjeta;
+    if (sel.value !== S.tarjeta) { S.tarjeta = '*'; sel.value = '*'; }
+  }
+
+  async function loadPeriodo() {
+    S.data = await api('getPeriodo', { periodo: S.periodo });
+    render();
+  }
+
+  async function refreshCatalogs() {
+    const boot = await api('bootstrap', {}, { silent: true });
+    S.cat = boot;
+    renderTarjetaFilter();
+  }
+
+  /* ============================ Tabs ============================ */
+
+  const ICONS = {
+    resumen: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+    movimientos: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
+    responsables: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    cuadre: '<path d="M12 3v18"/><path d="M7 21h10"/><path d="M3 7h18"/><path d="m6 7-3 8a3 3 0 0 0 6 0Z"/><path d="m18 7-3 8a3 3 0 0 0 6 0Z"/>',
+    importar: '<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/>',
+    config: '<path d="M4 6h10"/><path d="M18 6h2"/><circle cx="16" cy="6" r="2"/><path d="M4 12h4"/><path d="M12 12h8"/><circle cx="10" cy="12" r="2"/><path d="M4 18h12"/><path d="M20 18h0"/><circle cx="18" cy="18" r="2"/>',
+    mis: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
+  };
+  const icon = k => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[k] || ''}</svg>`;
+
+  const TABS_ADMIN = [
+    ['resumen', 'Resumen'], ['movimientos', 'Movimientos'], ['responsables', 'Por responsable'],
+    ['cuadre', 'Cuadre'], ['importar', 'Importar Excel'], ['config', 'Configuración'],
+  ];
+  const TABS_RESP = [['mis', 'Mis cargos'], ['config', 'Mi cuenta']];
+
+  function tabCount(key) {
+    const movs = movsFiltradas();
+    if (key === 'movimientos' || key === 'mis') return movs.length || '';
+    if (key === 'responsables') return Object.keys(totalesPorResponsable(movs)).length || '';
+    if (key === 'cuadre') {
+      const pend = movs.filter(m => tarjetaTipo(m.tarjeta) === 'credito' && pendiente(m) !== 0).length;
+      return pend ? '!' + pend : (movs.length ? '✓' : '');
+    }
+    return '';
+  }
+
+  function renderTabs() {
+    const tabs = isAdmin() ? TABS_ADMIN : TABS_RESP;
+    if (!S.tab || !tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
+    $('#tabs').innerHTML = tabs.map(t =>
+      `<button data-tab="${t[0]}" title="${t[1]}" ${t[0] === S.tab ? 'aria-current="page"' : ''}>${icon(t[0])}<span class="label">${t[1]}</span><span class="count">${tabCount(t[0])}</span></button>`).join('');
+    const movs = movsFiltradas();
+    const total = isAdmin() ? r2(movs.reduce((s, m) => s + net(m), 0)) : (totalesPorResponsable(movs)[S.session.responsable] || 0);
+    $('#sidebar-foot').innerHTML = `<span>${periodoTitulo()}</span><b>${fmt(total)}</b><span>${isAdmin() ? 'gasto neto' : 'a pagar'}</span>`;
+  }
+
+  function render() {
+    renderTabs();
+    const main = $('#main');
+    const fn = VIEWS[S.tab];
+    main.innerHTML = '';
+    fn(main);
+  }
+
+  function go(tab) {
+    S.tab = tab;
+    render();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function pageHead(eyebrow, title, meta, extra) {
+    return `<div class="page-head"><div><div class="eyebrow">${eyebrow}</div><h1>${title}</h1></div>
+      <div class="crumbs">${extra || ''}${meta ? `<span class="meta">${meta}</span>` : ''}</div></div>`;
+  }
+  function periodoTitulo() { return periodLabel(S.periodo) + (S.tarjeta !== '*' ? ' · ' + esc(S.tarjeta) : ''); }
+
+  /* ============================ Vistas ============================ */
+
+  const VIEWS = {};
+
+  /** Barras horizontales; con opts.kind cada fila es un botón que lleva al detalle. */
+  function barList(obj, opts) {
+    opts = opts || {};
+    const entries = Object.entries(obj).filter(e => e[1] !== 0).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) return '<div class="empty">Sin datos</div>';
+    const max = Math.max.apply(null, entries.map(e => Math.abs(e[1])));
+    return '<div class="bars">' + entries.map(([k, v]) => {
+      const w = max ? Math.max(1, Math.abs(v) / max * 100) : 0;
+      const pct = opts.total ? ' · ' + (v / opts.total * 100).toFixed(1) + '%' : '';
+      const tag = opts.kind ? 'button' : 'div';
+      const attrs = opts.kind ? ` type="button" data-act="drill" data-kind="${opts.kind}" data-key="${esc(k)}"` : '';
+      return `<${tag} class="bar-row${k === '(Sin asignar)' ? ' pending' : ''}"${attrs} title="${esc(k)}: ${fmt(v)}${pct}${opts.kind ? ' · clic para ver el detalle' : ''}">
+        <span class="name">${esc(k)}</span>
+        <span class="track"><span class="fill" style="width:${w}%"></span></span>
+        <span class="num">${fmt(v)}</span>
+        <span class="go" aria-hidden="true">${opts.kind ? '›' : ''}</span></${tag}>`;
+    }).join('') + '</div>';
+  }
+
+  /** Navegación desde las barras del resumen al detalle. */
+  function drill(kind, key) {
+    if (kind === 'cat' && S.tab === 'mis') {
+      S.misCat = key === '(Sin categoría)' ? '__none' : key;
+      render();
+      return;
+    }
+    S.fromResumen = true;
+    if (kind === 'cat') {
+      S.movFilter = { q: '', cat: key === '(Sin categoría)' ? '__none' : key, resp: '', pendientes: false };
+      go('movimientos');
+    } else if (kind === 'resp') {
+      if (key === '(Sin asignar)') { S.movFilter = { q: '', cat: '', resp: '', pendientes: true }; go('movimientos'); return; }
+      S.respFocus = key;
+      go('responsables');
+    } else if (kind === 'tarjeta') {
+      S.tarjeta = key;
+      $('#f-tarjeta').value = key;
+      S.movFilter = { q: '', cat: '', resp: '', pendientes: false };
+      go('movimientos');
+    }
+  }
+  function backBtn() { return S.fromResumen ? '<button class="btn small" data-act="back">‹ Volver al resumen</button>' : ''; }
+
+  function statCard(label, value, sub, extra) {
+    return `<div class="card stat"><div class="label">${label}</div><div class="value">${value}</div>
+      ${sub ? `<div class="sub">${sub}</div>` : ''}${extra || ''}</div>`;
+  }
+
+  function limiteCard(total) {
+    const lim = limiteActual();
+    const st = limiteStatus(total, lim);
+    const color = st.cls === 'bad' ? 'var(--meter-bad)' : st.cls === 'warn' ? 'var(--meter-warn)' : 'var(--meter-good)';
+    const meter = lim ? `<div class="meter" role="meter" aria-valuenow="${st.pct.toFixed(0)}" aria-valuemin="0" aria-valuemax="100">
+        <span style="width:${Math.min(100, st.pct)}%;background:${color}"></span></div>` : '';
+    return statCard('Límite mensual' + (S.tarjeta === '*' ? '' : ' · ' + esc(S.tarjeta)),
+      lim ? fmt(lim) : '—',
+      `<span class="badge ${st.cls}">${st.text}</span>` + (lim ? `<span>${st.pct.toFixed(0)}% usado</span>` : ''),
+      meter);
+  }
+
+  VIEWS.resumen = function (el) {
+    const movs = movsFiltradas();
+    const cargos = r2(movs.filter(m => m.tipo !== 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
+    const devs = r2(movs.filter(m => m.tipo === 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
+    const total = r2(cargos - devs);
+    const sinAsignar = r2(movs.reduce((s, m) => s + pendiente(m), 0));
+    const porCat = sumBy(movs, m => m.categoria || '(Sin categoría)', net);
+    const porResp = totalesPorResponsable(movs);
+    if (sinAsignar) porResp['(Sin asignar)'] = sinAsignar;
+    const porTarjeta = sumBy(movs, m => m.tarjeta, net);
+
+    el.innerHTML = `
+      ${pageHead('Resumen del periodo', periodoTitulo(), movs.length + ' movimientos · clic en una barra para ver el detalle')}
+      <div class="grid cols-4">
+        ${statCard('Gasto neto del periodo', fmt(total), movs.length + ' movimientos')}
+        ${limiteCard(total)}
+        ${statCard('Devoluciones', fmt(devs), 'Cargos brutos ' + fmt(cargos))}
+        ${statCard('Sin asignar', fmt(sinAsignar), sinAsignar ? '<span class="badge warn">! Asigna responsables</span>' : '<span class="badge good">✓ Todo asignado</span>')}
+      </div>
+      <div class="grid cols-2">
+        <div class="card"><div class="card-head"><h3>Gasto por categoría</h3><span class="meta">${Object.keys(porCat).length} categorías</span></div>${barList(porCat, { total: total, kind: 'cat' })}</div>
+        <div class="card"><div class="card-head"><h3>A pagar por responsable</h3><span class="meta">${Object.keys(porResp).length} responsables</span></div>${barList(porResp, { total: total, kind: 'resp' })}</div>
+      </div>
+      ${S.tarjeta === '*' ? `<div class="card"><div class="card-head"><h3>Gasto por tarjeta</h3></div>${barList(porTarjeta, { total: total, kind: 'tarjeta' })}</div>` : ''}
+      <div class="card panel" id="historial-card"><h3>Historial por periodo</h3><div class="muted">Cargando…</div></div>`;
+    renderHistorial($('#historial-card'));
+  };
+
+  async function renderHistorial(card) {
+    try {
+      const rows = await api('historial', {}, { silent: true });
+      const periodos = Array.from(new Set(rows.map(r => r.periodo))).sort().reverse().slice(0, 13);
+      const resps = Array.from(new Set(rows.map(r => r.responsable))).sort();
+      if (!periodos.length) { card.innerHTML = '<h3>Historial por periodo</h3><div class="empty">Sin datos</div>'; return; }
+      const val = (p, r) => (rows.find(x => x.periodo === p && x.responsable === r) || {}).total || 0;
+      card.innerHTML = `<div class="card-head"><h3>Historial por periodo</h3><span class="meta">${periodos.length} periodos</span></div><div class="table-wrap"><table>
+        <thead><tr><th>Periodo</th>${resps.map(r => `<th class="num">${esc(r)}</th>`).join('')}${resps.length > 1 ? '<th class="num">Total</th>' : ''}</tr></thead>
+        <tbody>${periodos.map(p => {
+          const tot = resps.reduce((s, r) => s + val(p, r), 0);
+          return `<tr><td>${periodLabel(p)}</td>${resps.map(r => `<td class="num">${fmt(val(p, r))}</td>`).join('')}${resps.length > 1 ? `<td class="num"><b>${fmt(tot)}</b></td>` : ''}</tr>`;
+        }).join('')}</tbody></table></div>`;
+    } catch (e) {
+      card.innerHTML = '<h3>Historial por periodo</h3><div class="error">' + esc(e.message) + '</div>';
+    }
+  }
+
+  VIEWS.movimientos = function (el) {
+    const f = S.movFilter;
+    let movs = movsFiltradas();
+    if (f.q) { const q = f.q.toLowerCase(); movs = movs.filter(m => (m.descripcion + ' ' + m.notas).toLowerCase().includes(q)); }
+    if (f.cat) movs = movs.filter(m => f.cat === '__none' ? !m.categoria : m.categoria === f.cat);
+    if (f.resp) movs = movs.filter(m => asigOf(m.id).some(a => a.responsable === f.resp));
+    if (f.pendientes) movs = movs.filter(m => pendiente(m) !== 0);
+    const total = r2(movs.reduce((s, m) => s + net(m), 0));
+
+    const pills = [];
+    if (f.cat) pills.push(['cat', 'Categoría: ' + (f.cat === '__none' ? '(Sin categoría)' : f.cat)]);
+    if (f.resp) pills.push(['resp', 'Responsable: ' + f.resp]);
+    if (f.pendientes) pills.push(['pendientes', 'Solo sin asignar']);
+    if (f.q) pills.push(['q', 'Búsqueda: ' + f.q]);
+    const titulo = f.cat ? (f.cat === '__none' ? 'Sin categoría' : esc(f.cat)) : f.resp ? esc(f.resp) : f.pendientes ? 'Sin asignar' : 'Movimientos';
+
+    el.innerHTML = `
+      ${pageHead('Movimientos · ' + periodoTitulo(), titulo, movs.length + ' movimientos · ' + fmt(total), backBtn())}
+      ${pills.length ? `<div class="crumbs">${pills.map(([k, t]) => `<span class="filter-pill">${esc(t)}<button type="button" data-act="clear-filter" data-k="${k}" aria-label="Quitar filtro">✕</button></span>`).join('')}
+        ${pills.length > 1 ? '<button class="btn small ghost" data-act="clear-filter" data-k="*">Limpiar filtros</button>' : ''}</div>` : ''}
+      <div class="toolbar">
+        <div class="left">
+          <input type="search" id="mf-q" placeholder="Buscar…" value="${esc(f.q)}">
+          <select id="mf-cat"><option value="">Todas las categorías</option><option value="__none" ${f.cat === '__none' ? 'selected' : ''}>(Sin categoría)</option>${S.cat.categorias.map(c => `<option ${c.nombre === f.cat ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select>
+          <select id="mf-resp"><option value="">Todos los responsables</option>${S.cat.responsables.map(r => `<option ${r.nombre === f.resp ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select>
+          <label class="inline"><input type="checkbox" id="mf-pend" ${f.pendientes ? 'checked' : ''}> Solo sin asignar</label>
+        </div>
+        <div class="right">
+          <button class="btn" data-act="new-dev">+ Devolución</button>
+          <button class="btn primary" data-act="new-mov">+ Nuevo gasto</button>
+        </div>
+      </div>
+      <div class="card table-wrap">
+        ${movs.length ? `<table>
+          <thead><tr><th>Fecha</th><th>Descripción</th><th>Categoría</th>${S.tarjeta === '*' ? '<th>Tarjeta</th>' : ''}<th>Responsables</th><th class="num">Monto</th><th></th></tr></thead>
+          <tbody>${movs.map(m => {
+            const pend = pendiente(m);
+            const msi = m.msi_total ? `MSI ${m.msi_actual}/${m.msi_total}` : '';
+            return `<tr>
+              <td>${fmtDate(m.fecha)}</td>
+              <td class="desc">${esc(m.descripcion)}<small>${[m.tipo === 'devolucion' ? 'Devolución' : '', msi, esc(m.notas)].filter(Boolean).join(' · ')}</small></td>
+              <td>${m.categoria ? `<span class="tag">${esc(m.categoria)}</span>` : '<span class="muted">—</span>'}</td>
+              ${S.tarjeta === '*' ? `<td>${esc(m.tarjeta)}</td>` : ''}
+              <td><div class="chips">${asigOf(m.id).map(a => `<span class="chip" title="${esc(a.concepto)}">${esc(a.responsable)} ${fmt(a.monto)}</span>`).join('')}
+                ${pend ? `<span class="badge ${pend > 0 ? 'warn' : 'bad'}">${pend > 0 ? 'Falta' : 'Excede'} ${fmt(Math.abs(pend))}</span>` : ''}</div></td>
+              <td class="num ${m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(net(m))}</td>
+              <td class="num"><button class="btn small ghost" data-act="edit" data-id="${m.id}">Editar</button><button class="btn small ghost danger" data-act="del" data-id="${m.id}" aria-label="Eliminar">✕</button></td>
+            </tr>`;
+          }).join('')}</tbody>
+          <tfoot><tr><td colspan="${S.tarjeta === '*' ? 5 : 4}">Total (${movs.length})</td><td class="num">${fmt(total)}</td><td></td></tr></tfoot>
+        </table>` : `<div class="empty">${pills.length ? 'Ningún movimiento coincide con los filtros.' : 'No hay movimientos en este periodo. Agrega un gasto o importa el Excel del estado de cuenta.'}</div>`}
+      </div>`;
+
+    const rerender = () => { const pos = $('#mf-q').selectionStart; render(); const q = $('#mf-q'); q.focus(); q.setSelectionRange(pos, pos); };
+    $('#mf-q').addEventListener('input', e => { f.q = e.target.value; rerender(); });
+    $('#mf-cat').addEventListener('change', e => { f.cat = e.target.value; render(); });
+    $('#mf-resp').addEventListener('change', e => { f.resp = e.target.value; render(); });
+    $('#mf-pend').addEventListener('change', e => { f.pendientes = e.target.checked; render(); });
+  };
+
+  function respResumen(n, ids) {
+    const items = S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id]);
+    const c = r2(items.filter(a => ids[a.movimiento_id].tipo !== 'devolucion').reduce((s, a) => s + Number(a.monto), 0));
+    const d = r2(items.filter(a => ids[a.movimiento_id].tipo === 'devolucion').reduce((s, a) => s + Number(a.monto), 0));
+    return { cargos: c, devs: d, total: r2(c - d), count: items.length };
+  }
+
+  VIEWS.responsables = function (el) {
+    const movs = movsFiltradas();
+    const ids = {};
+    movs.forEach(m => { ids[m.id] = m; });
+    const totals = totalesPorResponsable(movs);
+    const sinAsignar = r2(movs.reduce((s, m) => s + pendiente(m), 0));
+    const totalMovs = r2(movs.reduce((s, m) => s + net(m), 0));
+    const names = S.cat.responsables.map(r => r.nombre).filter(n => totals[n] !== undefined);
+    Object.keys(totals).forEach(n => { if (names.indexOf(n) < 0) names.push(n); });
+    const focus = S.respFocus;
+    const selector = `<select id="resp-sel" aria-label="Responsable"><option value="">Todos los responsables</option>${S.cat.responsables.map(r => `<option ${r.nombre === focus ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select>`;
+
+    if (focus) {
+      const rs = respResumen(focus, ids);
+      const porCat = {};
+      S.data.asignaciones.filter(a => a.responsable === focus && ids[a.movimiento_id]).forEach(a => {
+        const m = ids[a.movimiento_id];
+        const k = m.categoria || '(Sin categoría)';
+        porCat[k] = r2((porCat[k] || 0) + (m.tipo === 'devolucion' ? -1 : 1) * Number(a.monto));
+      });
+      el.innerHTML = `
+        ${pageHead('Cargos del responsable · ' + periodoTitulo(), esc(focus), rs.count + ' cargos', backBtn() + selector)}
+        <div class="grid cols-4">
+          ${statCard('Total a pagar', fmt(rs.total), totalMovs ? (rs.total / totalMovs * 100).toFixed(1) + '% del gasto del periodo' : '')}
+          ${statCard('Cargos', fmt(rs.cargos), rs.count + ' movimientos')}
+          ${statCard('Devoluciones', fmt(rs.devs), rs.devs ? 'A su favor' : 'Sin devoluciones')}
+        </div>
+        <div class="grid cols-2" style="grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr)">
+          ${detalleResponsable(focus, ids, true)}
+          <div class="card panel"><div class="card-head"><h3>Por categoría</h3></div>${barList(porCat, { total: rs.total })}</div>
+        </div>`;
+    } else {
+      el.innerHTML = `
+        ${pageHead('Por responsable · ' + periodoTitulo(), 'Total a pagar', names.length + ' responsables · ' + fmt(totalMovs), backBtn() + selector)}
+        <div class="card table-wrap">
+          <table><thead><tr><th>Responsable</th><th class="num">Cargos</th><th class="num">Devoluciones</th><th class="num">Total a pagar</th><th></th></tr></thead>
+          <tbody>${names.map(n => {
+            const rs = respResumen(n, ids);
+            return `<tr><td><span class="user-chip"><span class="avatar">${esc(n.charAt(0))}</span>${esc(n)}</span></td><td class="num">${fmt(rs.cargos)}</td><td class="num neg">${rs.devs ? '−' + fmt(rs.devs) : ''}</td>
+              <td class="num"><b>${fmt(totals[n])}</b></td><td class="num"><button class="btn small" data-act="resp-focus" data-key="${esc(n)}">Ver cargos ›</button></td></tr>`;
+          }).join('')}
+          ${sinAsignar ? `<tr><td><span class="badge warn">! Sin asignar</span></td><td></td><td></td><td class="num">${fmt(sinAsignar)}</td><td class="num"><button class="btn small" data-act="drill" data-kind="resp" data-key="(Sin asignar)">Asignar ›</button></td></tr>` : ''}
+          </tbody>
+          <tfoot><tr><td>Total</td><td></td><td></td><td class="num">${fmt(totalMovs)}</td><td></td></tr></tfoot></table></div>
+        <div class="grid cols-2">${names.map(n => detalleResponsable(n, ids)).join('')}</div>`;
+    }
+    $('#resp-sel').addEventListener('change', e => { S.respFocus = e.target.value; render(); });
+  };
+
+  /** Tabla de cargos de un responsable. full = columnas completas (vista enfocada). */
+  function detalleResponsable(n, ids, full, catFilter) {
+    let items = S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id])
+      .map(a => ({ a: a, m: ids[a.movimiento_id] }))
+      .sort((x, y) => String(y.m.fecha).localeCompare(String(x.m.fecha)));
+    if (catFilter) items = items.filter(x => catFilter === '__none' ? !x.m.categoria : x.m.categoria === catFilter);
+    const sg = x => (x.m.tipo === 'devolucion' ? -1 : 1);
+    const tot = r2(items.reduce((s, x) => s + sg(x) * Number(x.a.monto), 0));
+    const head = full
+      ? `<div class="card-head"><h3>Detalle de cargos</h3><span class="meta">${items.length} · ${fmt(tot)}</span></div>`
+      : `<div class="card-head"><h3><button class="btn small ghost" style="padding-left:0" data-act="resp-focus" data-key="${esc(n)}">${esc(n)} ›</button></h3><span class="meta">${fmt(tot)}</span></div>`;
+    return `<div class="card table-wrap">${head}<table>
+      ${full ? `<thead><tr><th>Fecha</th><th>Concepto</th><th>Categoría</th><th class="num">Cargo total</th><th class="num">Le toca</th></tr></thead>` : ''}
+      <tbody>${items.map(x => `
+      <tr><td>${fmtDate(x.m.fecha)}</td>
+      <td class="desc">${esc(x.a.concepto || x.m.descripcion)}<small>${full ? esc(x.m.descripcion) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' ? ' · ' + esc(x.m.tarjeta) : '')
+        : esc(x.m.categoria) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' ? ' · ' + esc(x.m.tarjeta) : '')}</small></td>
+      ${full ? `<td>${x.m.categoria ? `<span class="tag">${esc(x.m.categoria)}</span>` : ''}</td><td class="num muted">${fmt(sg(x) * x.m.monto)}</td>` : ''}
+      <td class="num ${x.m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(sg(x) * x.a.monto)}</td></tr>`).join('')}
+      </tbody>${full ? `<tfoot><tr><td colspan="4">Total a pagar</td><td class="num">${fmt(tot)}</td></tr></tfoot>` : ''}</table></div>`;
+  }
+
+  function cuadreData(tarjeta) {
+    const movs = S.data.movimientos.filter(m => m.tarjeta === tarjeta);
+    const cargos = r2(movs.filter(m => m.tipo !== 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
+    const devs = r2(movs.filter(m => m.tipo === 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
+    const neto = r2(cargos - devs);
+    const porResp = totalesPorResponsable(movs);
+    const asignadoTot = r2(Object.values(porResp).reduce((s, v) => s + v, 0));
+    const est = S.data.estados.find(e => e.tarjeta === tarjeta);
+    const estado = est && est.total !== '' ? Number(est.total) : null;
+    const pendientes = movs.filter(m => pendiente(m) !== 0);
+    return { movs, cargos, devs, neto, porResp, asignadoTot, estado, pendientes,
+             difAsig: r2(neto - asignadoTot), difEstado: estado === null ? null : r2(estado - neto) };
+  }
+
+  VIEWS.cuadre = function (el) {
+    const cards = S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === '*' || t.nombre === S.tarjeta));
+    const head = pageHead('Cuadre de tarjeta de crédito', periodoTitulo(), 'Movimientos = responsables = estado de cuenta');
+    if (!cards.length) { el.innerHTML = head + '<div class="card empty">El cuadre aplica a tarjetas de crédito. Selecciona una tarjeta de crédito.</div>'; return; }
+    el.innerHTML = head + cards.map(t => {
+      const c = cuadreData(t.nombre);
+      const okAsig = Math.abs(c.difAsig) < 0.01;
+      const okEst = c.difEstado !== null && Math.abs(c.difEstado) < 0.01;
+      const badge = (ok, txt) => `<span class="badge ${ok ? 'good' : 'bad'}">${ok ? '✓ ' : '✕ '}${txt}</span>`;
+      return `<div class="card table-wrap">
+        <div class="toolbar" style="margin-bottom:8px"><h2>${esc(t.nombre)}</h2>
+          <div class="crumbs">${badge(okAsig, okAsig ? 'Responsables cuadrados' : 'Descuadre ' + fmt(c.difAsig))}
+          ${c.estado === null ? '<span class="badge neutral">Captura el total del estado de cuenta</span>'
+            : (!okEst && c.devs && Math.abs(c.difEstado - c.devs) < 0.01) ? `<span class="badge warn">! Diferencia ${fmt(c.difEstado)} = devoluciones aún no reflejadas en el estado de cuenta</span>`
+            : badge(okEst, okEst ? 'Coincide con estado de cuenta' : 'Diferencia ' + fmt(c.difEstado))}</div></div>
+        <table><tbody>
+          <tr><td>Cargos del periodo (${c.movs.filter(m => m.tipo !== 'devolucion').length})</td><td class="num">${fmt(c.cargos)}</td></tr>
+          <tr><td>(−) Devoluciones</td><td class="num neg">${c.devs ? '−' + fmt(c.devs) : fmt(0)}</td></tr>
+          <tr><td><b>Total neto de movimientos</b></td><td class="num"><b>${fmt(c.neto)}</b></td></tr>
+          <tr><td>Total según estado de cuenta</td><td class="num"><form class="inline-form" data-estado="${esc(t.nombre)}" style="display:flex;gap:.4rem;justify-content:flex-end">
+            <input type="number" step="0.01" name="total" value="${c.estado === null ? '' : c.estado}" placeholder="0.00" style="width:130px;text-align:right">
+            <button class="btn small">Guardar</button></form></td></tr>
+          <tr><td>Diferencia estado de cuenta − movimientos</td><td class="num ${okEst ? 'diff-ok' : 'diff-bad'}">${c.difEstado === null ? '—' : fmt(c.difEstado)}</td></tr>
+          <tr><td colspan="2"><b>Suma por responsable</b></td></tr>
+          ${Object.entries(c.porResp).sort((a, b) => b[1] - a[1]).map(([n, v]) => `<tr><td style="padding-left:1.5rem">${esc(n)}</td><td class="num">${fmt(v)}</td></tr>`).join('')}
+          <tr><td><b>Total asignado a responsables</b></td><td class="num"><b>${fmt(c.asignadoTot)}</b></td></tr>
+          <tr><td>Diferencia movimientos − asignado</td><td class="num ${okAsig ? 'diff-ok' : 'diff-bad'}">${fmt(c.difAsig)}</td></tr>
+        </tbody></table>
+        ${c.pendientes.length ? `<div class="card-head" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)"><h3>Movimientos con reparto incompleto</h3><span class="meta">${c.pendientes.length}</span></div><table><tbody>${c.pendientes.map(m => `
+          <tr><td>${fmtDate(m.fecha)}</td><td class="desc">${esc(m.descripcion)}</td><td class="num">${fmt(m.monto)}</td>
+          <td class="num"><span class="badge warn">Pendiente ${fmt(pendiente(m))}</span></td>
+          <td class="num"><button class="btn small" data-act="edit" data-id="${m.id}">Asignar</button></td></tr>`).join('')}</tbody></table>` : ''}
+      </div>`;
+    }).join('');
+
+    $$('form[data-estado]', el).forEach(f => f.addEventListener('submit', async ev => {
+      ev.preventDefault();
+      try {
+        await api('saveEstado', { periodo: S.periodo, tarjeta: f.dataset.estado, total: f.total.value === '' ? '' : Number(f.total.value) });
+        toast('Total del estado de cuenta guardado');
+        await loadPeriodo();
+      } catch (e) { toast(e.message); }
+    }));
+  };
+
+  /* ---------- Vista de responsable ---------- */
+
+  VIEWS.mis = function (el) {
+    const movs = movsFiltradas();
+    const ids = {};
+    movs.forEach(m => { ids[m.id] = m; });
+    const me = S.session.responsable;
+    const rs = respResumen(me, ids);
+    const porCat = {};
+    S.data.asignaciones.filter(a => ids[a.movimiento_id]).forEach(a => {
+      const m = ids[a.movimiento_id];
+      const k = m.categoria || '(Sin categoría)';
+      porCat[k] = r2((porCat[k] || 0) + (m.tipo === 'devolucion' ? -1 : 1) * Number(a.monto));
+    });
+    const catName = S.misCat === '__none' ? '(Sin categoría)' : S.misCat;
+    el.innerHTML = `
+      ${pageHead('Mis cargos · ' + periodoTitulo(), 'Hola ' + esc(me), rs.count + ' cargos')}
+      <div class="grid cols-4">
+        ${statCard('Total a pagar', fmt(rs.total), rs.count + ' cargos' + (S.tarjeta !== '*' ? ' en ' + esc(S.tarjeta) : ''))}
+        ${statCard('Devoluciones', fmt(rs.devs), rs.devs ? 'A tu favor' : 'Sin devoluciones')}
+      </div>
+      ${S.misCat ? `<div class="crumbs"><span class="filter-pill">Categoría: ${esc(catName)}<button type="button" data-act="mis-cat" aria-label="Quitar filtro">✕</button></span></div>` : ''}
+      <div class="grid cols-2" style="grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr)">
+        ${detalleResponsable(me, ids, true, S.misCat)}
+        <div class="card panel"><div class="card-head"><h3>Por categoría</h3><span class="meta">clic para filtrar</span></div>${barList(porCat, { total: rs.total, kind: 'cat' })}</div>
+      </div>
+      <div class="card panel" id="historial-card"><h3>Mi historial</h3><div class="muted">Cargando…</div></div>`;
+    renderHistorial($('#historial-card'));
+  };
+
+  /* ---------- Configuración ---------- */
+
+  VIEWS.config = function (el) {
+    const pwd = `<div class="card"><h3>Cambiar mi contraseña</h3>
+      <form id="form-pwd" class="form-grid">
+        <label>Contraseña actual <input type="password" name="actual" required autocomplete="current-password"></label>
+        <label>Nueva contraseña <input type="password" name="nueva" required minlength="6" autocomplete="new-password"></label>
+        <div style="align-self:end"><button class="btn primary">Actualizar</button></div>
+      </form></div>`;
+    if (!isAdmin()) { el.innerHTML = pageHead('Mi cuenta', esc(S.session.usuario), esc(S.session.responsable)) + pwd; bindPwd(); return; }
+
+    const catTable = (tipo, rows, extra) => `<div class="card table-wrap"><h3>${tipo}</h3>
+      <table><tbody>${rows.map(r => `<tr>
+        <td>${esc(r.nombre)}${extra ? ' <span class="muted">' + extra(r) + '</span>' : ''}</td>
+        <td>${isActive(r) ? '<span class="badge good">Activo</span>' : '<span class="badge neutral">Inactivo</span>'}</td>
+        <td class="num"><button class="btn small ghost" data-act="cat-edit" data-tipo="${tipo}" data-id="${r.id}">Editar</button></td></tr>`).join('')}</tbody></table>
+      <div style="margin-top:.6rem"><button class="btn small" data-act="cat-new" data-tipo="${tipo}">+ Agregar</button></div></div>`;
+
+    const limRows = S.cat.limites.slice().sort((a, b) => String(b.periodo).localeCompare(String(a.periodo)));
+    el.innerHTML = `
+      ${pageHead('Configuración', 'Catálogos y accesos', 'Límites · tarjetas · responsables · usuarios')}
+      <div class="card table-wrap"><h3>Límites de gasto mensual</h3>
+        <p class="muted">El límite de un periodo específico tiene prioridad sobre el límite general ("Todos los periodos"). "Todas" aplica al gasto conjunto de todas las tarjetas.</p>
+        <table><thead><tr><th>Periodo</th><th>Tarjeta</th><th class="num">Límite</th><th></th></tr></thead><tbody>
+        ${limRows.map(l => `<tr><td>${periodLabel(String(l.periodo))}</td><td>${l.tarjeta === '*' ? 'Todas' : esc(l.tarjeta)}</td><td class="num">${fmt(l.monto)}</td>
+          <td class="num"><button class="btn small ghost danger" data-act="lim-del" data-p="${esc(l.periodo)}" data-t="${esc(l.tarjeta)}">✕</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">Sin límites</td></tr>'}
+        </tbody></table>
+        <form id="form-lim" class="form-grid" style="margin-top:.8rem">
+          <label>Periodo <select name="periodo"><option value="*">Todos los periodos</option><option value="${S.periodo}">${periodLabel(S.periodo)}</option></select></label>
+          <label>Tarjeta <select name="tarjeta"><option value="*">Todas</option>${S.cat.tarjetas.map(t => `<option>${esc(t.nombre)}</option>`).join('')}</select></label>
+          <label>Límite (MXN) <input type="number" step="0.01" min="0" name="monto" required></label>
+          <div style="align-self:end"><button class="btn primary">Guardar límite</button></div>
+        </form></div>
+      <div class="grid cols-2">
+        ${catTable('Tarjetas', S.cat.tarjetas, r => r.tipo === 'credito' ? 'crédito' : 'débito')}
+        ${catTable('Responsables', S.cat.responsables)}
+        ${catTable('Categorias', S.cat.categorias)}
+        <div class="card table-wrap" id="users-card"><h3>Usuarios</h3><div class="muted">Cargando…</div></div>
+      </div>
+      ${pwd}`;
+    bindPwd();
+
+    $('#form-lim').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const f = ev.target;
+      try {
+        await api('saveLimite', { periodo: f.periodo.value, tarjeta: f.tarjeta.value, monto: Number(f.monto.value) });
+        await refreshCatalogs(); render(); toast('Límite guardado');
+      } catch (e) { toast(e.message); }
+    });
+    loadUsers();
+  };
+
+  function bindPwd() {
+    $('#form-pwd').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const f = ev.target;
+      try {
+        await api('cambiarPassword', { actual: f.actual.value, nueva: f.nueva.value });
+        f.reset(); toast('Contraseña actualizada');
+      } catch (e) { toast(e.message); }
+    });
+  }
+
+  async function loadUsers() {
+    const card = $('#users-card');
+    try {
+      const users = await api('listUsuarios', {}, { silent: true });
+      S.users = users;
+      card.innerHTML = `<h3>Usuarios</h3><table><tbody>${users.map(u => `<tr>
+        <td>${esc(u.usuario)}</td><td>${u.rol === 'admin' ? 'Administrador' : 'Responsable'}${u.responsable ? ' · ' + esc(u.responsable) : ''}</td>
+        <td>${isActive(u) ? '<span class="badge good">Activo</span>' : '<span class="badge neutral">Inactivo</span>'}</td>
+        <td class="num"><button class="btn small ghost" data-act="user-edit" data-u="${esc(u.usuario)}">Editar</button></td></tr>`).join('')}</tbody></table>
+        <div style="margin-top:.6rem"><button class="btn small" data-act="user-new">+ Agregar usuario</button></div>`;
+    } catch (e) { card.innerHTML = '<h3>Usuarios</h3><div class="error">' + esc(e.message) + '</div>'; }
+  }
+
+  /* ============================ Modales ============================ */
+
+  function openModal(html) {
+    $('#modal-body').innerHTML = html;
+    const d = $('#modal');
+    if (!d.open) d.showModal();
+  }
+  function closeModal() { $('#modal').close(); }
+
+  function catalogModal(tipo, item) {
+    item = item || { activo: true };
+    openModal(`<h2>${item.id ? 'Editar' : 'Agregar'} · ${tipo}</h2>
+      <form id="form-cat" class="form-grid">
+        <label class="span-2">Nombre <input name="nombre" required value="${esc(item.nombre)}"></label>
+        ${tipo === 'Tarjetas' ? `<label>Tipo <select name="tipo"><option value="credito" ${item.tipo === 'credito' ? 'selected' : ''}>Crédito</option><option value="debito" ${item.tipo === 'debito' ? 'selected' : ''}>Débito</option></select></label>` : ''}
+        <label class="inline"><input type="checkbox" name="activo" ${isActive(item) ? 'checked' : ''}> Activo</label>
+        ${item.id ? '<p class="muted span-2">Cambiar el nombre no actualiza los movimientos ya capturados.</p>' : ''}
+        <div class="actions span-2"><button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
+      </form>`);
+    $('#form-cat').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const f = ev.target;
+      const it = { id: item.id, nombre: f.nombre.value.trim(), activo: f.activo.checked };
+      if (f.tipo) it.tipo = f.tipo.value;
+      try { await api('saveCatalogo', { tipo: tipo, item: it }); closeModal(); await refreshCatalogs(); render(); toast('Guardado'); }
+      catch (e) { toast(e.message); }
+    });
+  }
+
+  function userModal(u) {
+    const isNew = !u;
+    u = u || { rol: 'responsable', activo: true };
+    openModal(`<h2>${isNew ? 'Agregar' : 'Editar'} usuario</h2>
+      <form id="form-user" class="form-grid">
+        <label>Usuario <input name="usuario" required value="${esc(u.usuario)}" ${isNew ? '' : 'readonly'} autocomplete="off"></label>
+        <label>${isNew ? 'Contraseña' : 'Nueva contraseña (opcional)'} <input name="password" type="password" ${isNew ? 'required' : ''} minlength="6" autocomplete="new-password"></label>
+        <label>Rol <select name="rol"><option value="responsable" ${u.rol === 'responsable' ? 'selected' : ''}>Responsable (solo consulta sus cargos)</option><option value="admin" ${u.rol === 'admin' ? 'selected' : ''}>Administrador</option></select></label>
+        <label>Responsable <select name="responsable"><option value="">—</option>${S.cat.responsables.map(r => `<option ${r.nombre === u.responsable ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select></label>
+        <label class="inline"><input type="checkbox" name="activo" ${isActive(u) ? 'checked' : ''}> Activo</label>
+        <div class="actions span-2"><button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
+      </form>`);
+    $('#form-user').addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const f = ev.target;
+      try {
+        await api('saveUsuario', { user: { usuario: f.usuario.value, password: f.password.value, rol: f.rol.value, responsable: f.responsable.value, activo: f.activo.checked } });
+        closeModal(); loadUsers(); toast('Usuario guardado');
+      } catch (e) { toast(e.message); }
+    });
+  }
+
+  /** Formulario de gasto / devolución con reparto entre responsables. */
+  function movModal(m, tipoDefault) {
+    const isNew = !m;
+    m = m ? Object.assign({}, m) : {
+      periodo: S.periodo, tarjeta: S.tarjeta !== '*' ? S.tarjeta : ((S.cat.tarjetas.find(isActive) || {}).nombre || ''),
+      fecha: new Date().toISOString().slice(0, 10), tipo: tipoDefault || 'cargo', categoria: '', descripcion: '', monto: '', notas: '', ref_id: '',
+    };
+    let splits = isNew ? [] : asigOf(m.id).map(a => ({ responsable: a.responsable, monto: Number(a.monto), concepto: a.concepto }));
+    if (!splits.length) splits.push({ responsable: '', monto: '', concepto: '' });
+    const cargos = S.data.movimientos.filter(x => x.tipo !== 'devolucion');
+    const respOpts = sel => '<option value="">Responsable…</option>' + S.cat.responsables.filter(r => isActive(r) || r.nombre === sel)
+      .map(r => `<option ${r.nombre === sel ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('');
+
+    openModal(`<div><div class="eyebrow">${periodLabel(m.periodo)}</div><h2 style="margin-top:6px">${isNew ? 'Nuevo' : 'Editar'} ${m.tipo === 'devolucion' ? 'devolución' : 'gasto'}</h2></div>
+      <form id="form-mov">
+        <div class="form-grid">
+          <label>Tipo <select name="tipo"><option value="cargo" ${m.tipo === 'cargo' ? 'selected' : ''}>Gasto / cargo</option><option value="devolucion" ${m.tipo === 'devolucion' ? 'selected' : ''}>Devolución / abono</option></select></label>
+          <label>Periodo (mes de corte) <input type="month" name="periodo" required value="${esc(m.periodo)}"></label>
+          <label>Tarjeta <select name="tarjeta" required>${S.cat.tarjetas.filter(t => isActive(t) || t.nombre === m.tarjeta).map(t => `<option ${t.nombre === m.tarjeta ? 'selected' : ''}>${esc(t.nombre)}</option>`).join('')}</select></label>
+          <label>Fecha <input type="date" name="fecha" required value="${esc(String(m.fecha).slice(0, 10))}"></label>
+          <label class="span-2">Descripción <input name="descripcion" required value="${esc(m.descripcion)}" placeholder="Ej. NETFLIX COM o LIVERPOOL (002:006)"></label>
+          <label>Monto (MXN) <input type="number" name="monto" step="0.01" min="0.01" required value="${esc(m.monto)}"></label>
+          <label>Categoría <select name="categoria"><option value="">—</option>${S.cat.categorias.filter(c => isActive(c) || c.nombre === m.categoria).map(c => `<option ${c.nombre === m.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></label>
+          <label>MSI (mes actual / total) <span style="display:flex;gap:.3rem"><input type="number" name="msi_actual" min="0" value="${esc(m.msi_actual)}" style="width:50%"><input type="number" name="msi_total" min="0" value="${esc(m.msi_total)}" style="width:50%"></span></label>
+          <label id="ref-wrap" class="span-2" ${m.tipo === 'devolucion' ? '' : 'hidden'}>Compra original (opcional)
+            <select name="ref_id"><option value="">—</option>${cargos.map(c => `<option value="${c.id}" ${c.id === m.ref_id ? 'selected' : ''}>${fmtDate(c.fecha)} · ${esc(c.descripcion)} · ${fmt(c.monto)}</option>`).join('')}</select></label>
+          <label class="span-2">Notas <input name="notas" value="${esc(m.notas)}"></label>
+        </div>
+        <div class="split-box" style="margin-top:16px">
+        <div class="card-head" style="margin:0"><h3>¿Quién lo paga?</h3><span id="sp-status" class="status-line"></span></div>
+        <div id="splits" style="display:flex;flex-direction:column;gap:6px"></div>
+        <div class="toolbar">
+          <div class="left">
+            <button type="button" class="btn small" id="sp-add">+ Responsable</button>
+            <button type="button" class="btn small" id="sp-equal">Partes iguales</button>
+            <button type="button" class="btn small" id="sp-rest">Resto al último</button>
+            <button type="button" class="btn small" id="sp-copy" ${m.tipo === 'devolucion' ? '' : 'hidden'}>Copiar reparto de la compra</button>
+          </div>
+        </div>
+        </div>
+        <div class="actions" style="margin-top:1rem">
+          <button type="button" class="btn" data-act="close">Cancelar</button>
+          <button class="btn primary">Guardar</button>
+        </div>
+      </form>`);
+
+    const form = $('#form-mov');
+    const montoVal = () => r2(form.monto.value);
+    const drawSplits = () => {
+      $('#splits').innerHTML = splits.map((s, i) => `<div class="split-row" data-i="${i}">
+        <select data-k="responsable">${respOpts(s.responsable)}</select>
+        <input type="number" step="0.01" data-k="monto" value="${s.monto === '' ? '' : s.monto}" placeholder="Monto">
+        <input class="concepto" data-k="concepto" value="${esc(s.concepto)}" placeholder="Concepto (opcional)">
+        <button type="button" class="btn small ghost danger" data-rm="${i}" aria-label="Quitar">✕</button></div>`).join('');
+      status();
+    };
+    const status = () => {
+      const tot = r2(splits.reduce((s, x) => s + Number(x.monto || 0), 0));
+      const diff = r2(montoVal() - tot);
+      $('#sp-status').innerHTML = diff === 0 && montoVal()
+        ? `<span class="badge good">✓ Asignado ${fmt(tot)}</span>`
+        : `<span class="badge ${diff > 0 ? 'warn' : 'bad'}">Asignado ${fmt(tot)} · ${diff > 0 ? 'faltan' : 'sobran'} ${fmt(Math.abs(diff))}</span>`;
+    };
+    $('#splits').addEventListener('input', e => {
+      const row = e.target.closest('.split-row');
+      if (!row) return;
+      const s = splits[Number(row.dataset.i)];
+      s[e.target.dataset.k] = e.target.dataset.k === 'monto' ? e.target.value : e.target.value;
+      if (e.target.dataset.k === 'responsable' && splits.length === 1 && !s.monto) { s.monto = montoVal(); drawSplits(); return; }
+      status();
+    });
+    $('#splits').addEventListener('click', e => {
+      const rm = e.target.closest('[data-rm]');
+      if (!rm) return;
+      splits.splice(Number(rm.dataset.rm), 1);
+      if (!splits.length) splits.push({ responsable: '', monto: '', concepto: '' });
+      drawSplits();
+    });
+    $('#sp-add').onclick = () => { splits.push({ responsable: '', monto: '', concepto: '' }); drawSplits(); };
+    $('#sp-equal').onclick = () => {
+      const act = splits.filter(s => s.responsable);
+      if (!act.length) { toast('Elige primero los responsables'); return; }
+      const total = montoVal();
+      const part = Math.floor(total / act.length * 100) / 100;
+      act.forEach((s, i) => { s.monto = i === act.length - 1 ? r2(total - part * (act.length - 1)) : part; });
+      drawSplits();
+    };
+    $('#sp-rest').onclick = () => {
+      const last = splits[splits.length - 1];
+      const others = r2(splits.slice(0, -1).reduce((s, x) => s + Number(x.monto || 0), 0));
+      last.monto = r2(montoVal() - others);
+      drawSplits();
+    };
+    $('#sp-copy').onclick = () => {
+      const orig = S.data.movimientos.find(x => x.id === form.ref_id.value);
+      if (!orig) { toast('Selecciona la compra original'); return; }
+      splits = proportional(asigOf(orig.id), Number(orig.monto), montoVal());
+      if (!splits.length) splits = [{ responsable: '', monto: '', concepto: '' }];
+      drawSplits();
+    };
+    form.tipo.onchange = () => {
+      $('#ref-wrap').hidden = form.tipo.value !== 'devolucion';
+      $('#sp-copy').hidden = form.tipo.value !== 'devolucion';
+    };
+    form.ref_id.onchange = () => {
+      const orig = S.data.movimientos.find(x => x.id === form.ref_id.value);
+      if (orig) {
+        form.tarjeta.value = orig.tarjeta;
+        if (!form.categoria.value) form.categoria.value = orig.categoria;
+        if (!form.descripcion.value) form.descripcion.value = 'DEVOLUCIÓN ' + orig.descripcion;
+      }
+    };
+    form.monto.oninput = status;
+    form.descripcion.onblur = () => {
+      const msi = parseMSI(form.descripcion.value);
+      if (msi && !form.msi_total.value) { form.msi_actual.value = msi.actual; form.msi_total.value = msi.total; }
+      if (!form.categoria.value) {
+        const g = guessCategoria(form.descripcion.value);
+        if (g) form.categoria.value = g;
+      }
+    };
+    drawSplits();
+
+    form.addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const asign = splits.filter(s => s.responsable && Number(s.monto));
+      const tot = r2(asign.reduce((s, x) => s + Number(x.monto), 0));
+      if (tot !== montoVal() && !confirm(`El reparto (${fmt(tot)}) no coincide con el monto (${fmt(montoVal())}). ¿Guardar de todos modos?`)) return;
+      const mov = {
+        id: m.id, periodo: form.periodo.value, tarjeta: form.tarjeta.value, fecha: form.fecha.value,
+        descripcion: form.descripcion.value.trim(), monto: montoVal(), tipo: form.tipo.value, categoria: form.categoria.value,
+        msi_actual: form.msi_actual.value, msi_total: form.msi_total.value,
+        ref_id: form.tipo.value === 'devolucion' ? form.ref_id.value : '', notas: form.notas.value,
+      };
+      try {
+        await api('saveMovimiento', { movimiento: mov, asignaciones: asign.map(s => ({ responsable: s.responsable, monto: Number(s.monto), concepto: s.concepto })) });
+        closeModal(); toast('Guardado');
+        if (mov.periodo !== S.periodo) toast('Guardado en ' + periodLabel(mov.periodo));
+        await refreshCatalogs();
+        await loadPeriodo();
+      } catch (e) { toast(e.message); }
+    });
+  }
+
+  function proportional(asigs, origMonto, newMonto) {
+    if (!asigs.length || !origMonto) return [];
+    const out = asigs.map(a => ({ responsable: a.responsable, concepto: a.concepto || '', monto: r2(Number(a.monto) / origMonto * newMonto) }));
+    const diff = r2(newMonto - out.reduce((s, x) => s + x.monto, 0));
+    if (diff) out[out.length - 1].monto = r2(out[out.length - 1].monto + diff);
+    return out;
+  }
+
+  /* ============================ Importar Excel ============================ */
+
+  const CAT_RULES = [
+    [/\bGAS\b|GASOLIN|PEMEX|OXXO GAS|SHELL|MOBIL|BP /, 'Gasolina'],
+    [/NETFLIX|HBO|YOUTUBE|SPOTIFY|DISNEY|PARAMOUNT|MICROSOFT|XBOX|PRIME VIDEO|AMAZON PRIME|APPLE\.COM|VIX|CRUNCHYROLL|STAR\+/, 'Streaming'],
+    [/CINEPOLIS|CINEMEX|TICKET|TAQUILLA|APP TICKETS|ETICKET|BOLETO/, 'Entretenimiento'],
+    [/CFE|MEGACABLE|TOTALPLAY|IZZI|AGUA|NATURGY|GAS NATURAL/, 'Servicios'],
+    [/TELEFONICA|TELCEL|MOVISTAR|AT&T|ATT /, 'Telefonía'],
+    [/COMISION|IVA |INTERES|ANUALIDAD/, 'Comisiones e intereses'],
+    [/AIRBNB|HOTEL|VIAJES|AEROMEXICO|VOLARIS|VIVA ?AEROBUS|BOOKING|EXPEDIA|HOT EL/, 'Viajes'],
+    [/TOTAL PASS|SMART ?FIT|SPORTS WORLD|GYM/, 'Gimnasio'],
+    [/OPTICA|FARMACIA|HOSPITAL|MEDIC|DOCTOR|LABORATORIO/, 'Salud'],
+    [/SHEIN|ZARA|H&M|PULL|BERSHKA|C&A|SUBURBIA|NIKE|ADIDAS/, 'Ropa'],
+    [/REST |RESTAURANT|TACOS|TORTAS|PIZZA|REBANADAS|STARBUCKS|RAPPI|UBER ?EATS|DIDI ?FOOD|KEEPCASH|BAR /, 'Comida'],
+    [/COSTCO|SAMS|SAM'S|WAL ?MART|WALMART|SUPERCENTER|SORIANA|CHEDRAUI|LIVERPOOL|HOME ?DEPOT|BODEGA|LA COMER|HEB/, 'Casa'],
+    [/MACSTORE|APPLE STORE|BEST BUY|STEREN|CYBERPUERTA/, 'Tecnología'],
+  ];
+  function guessCategoria(desc) {
+    const d = String(desc || '').toUpperCase();
+    const names = S.cat.categorias.map(c => c.nombre);
+    for (const [re, cat] of CAT_RULES) if (re.test(d) && names.indexOf(cat) >= 0) return cat;
+    return '';
+  }
+  function descKey(desc) {
+    return String(desc || '').toUpperCase()
+      .replace(/\(\d{1,3}:\d{1,3}\)/g, ' ')
+      .split(/[^A-ZÁÉÍÓÚÑ0-9&+]+/)
+      .filter(w => w && !/\d/.test(w))
+      .slice(0, 2).join(' ');
+  }
+  function excelSerialToISO(v) {
+    if (v instanceof Date) return v.toISOString().slice(0, 10);
+    if (typeof v === 'number') return new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(v).trim());
+    return m ? m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0') : null;
+  }
+  function guessPeriodFromName(name) {
+    const n = name.toLowerCase();
+    const y = (/(20\d{2})/.exec(n) || [])[1];
+    const mi = MESES.findIndex(m => n.indexOf(m.toLowerCase()) >= 0);
+    return y && mi >= 0 ? y + '-' + String(mi + 1).padStart(2, '0') : null;
+  }
+
+  VIEWS.importar = function (el) {
+    el.innerHTML = `${pageHead('Importar', 'Estado de cuenta en Excel', 'Formato: A1 = tarjeta · Fecha | Descripción | Monto')}<div class="card panel">
+        <h3>Importar movimientos desde Excel</h3>
+        <p class="muted">Sube el Excel del estado de cuenta (formato: celda A1 con el nombre de la tarjeta y filas con Fecha | Descripción | Monto).
+        Los cargos negativos se toman como devoluciones. Se sugieren categoría y reparto con base en meses anteriores.</p>
+        <input type="file" id="imp-file" accept=".xlsx,.xls,.csv">
+      </div><div id="imp-preview"></div>`;
+    $('#imp-file').addEventListener('change', onImportFile);
+    if (S.importRows) drawImport();
+  };
+
+  async function onImportFile(ev) {
+    const file = ev.target.files[0];
+    if (!file) return;
+    if (!window.XLSX) { toast('No se pudo cargar la librería de Excel'); return; }
+    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+    const cardName = typeof (rows[0] || [])[0] === 'string' ? rows[0][0].trim() : '';
+    const items = [];
+    rows.forEach(r => {
+      const fecha = (typeof r[0] === 'number' || r[0] instanceof Date) ? excelSerialToISO(r[0]) : null;
+      if (!fecha || typeof r[2] !== 'number' || !r[1]) return;
+      items.push({ fecha: fecha, descripcion: String(r[1]).trim(), monto: r[2] });
+    });
+    if (!items.length) { toast('No se encontraron movimientos en el archivo'); return; }
+
+    const periodo = guessPeriodFromName(file.name) || S.periodo;
+    const tarjeta = (S.cat.tarjetas.find(t => t.nombre.toLowerCase() === cardName.toLowerCase()) || {}).nombre
+      || (S.tarjeta !== '*' ? S.tarjeta : (S.cat.tarjetas[0] || {}).nombre);
+    S.importMeta = { periodo: periodo, tarjeta: tarjeta, archivo: file.name, cardName: cardName };
+    S.importRows = items.map(it => ({
+      include: true, fecha: it.fecha, descripcion: it.descripcion, monto: Math.abs(r2(it.monto)),
+      tipo: it.monto < 0 ? 'devolucion' : 'cargo', categoria: '', splits: [],
+    }));
+    await applySuggestions();
+    drawImport();
+  }
+
+  async function applySuggestions() {
+    const meta = S.importMeta;
+    // historial: este periodo (duplicados) y 3 previos (sugerencias)
+    const hist = [];
+    const actual = await api('getPeriodo', { periodo: meta.periodo });
+    for (let i = 1; i <= 3; i++) {
+      try { hist.push(await api('getPeriodo', { periodo: shiftPeriod(meta.periodo, -i) }, { silent: true })); } catch (e) { /* ignore */ }
+    }
+    const byKey = {};
+    [actual].concat(hist).forEach((d, age) => d.movimientos.forEach(m => {
+      if (m.tipo === 'devolucion') return;
+      const k = descKey(m.descripcion);
+      if (!k) return;
+      (byKey[k] = byKey[k] || []).push({ m: m, age: age, asig: d.asignaciones.filter(a => a.movimiento_id === m.id) });
+    }));
+    // Mejor candidato: mismo plan MSI (mes anterior), luego monto más parecido, luego el más reciente.
+    const best = r => {
+      const cands = byKey[descKey(r.descripcion)];
+      if (!cands) return null;
+      const msi = parseMSI(r.descripcion);
+      const score = c => {
+        let s = c.age * 10 + Math.abs(Number(c.m.monto) - r.monto) / Math.max(r.monto, 1) * 100;
+        if (msi) s += (Number(c.m.msi_total) === msi.total && Number(c.m.msi_actual) === msi.actual - 1) ? -1000 : 500;
+        return s;
+      };
+      return cands.slice().sort((a, b) => score(a) - score(b))[0];
+    };
+    const dupKey = m => [m.tarjeta, String(m.fecha).slice(0, 10), r2(m.monto), m.descripcion.trim().toUpperCase()].join('|');
+    const existing = new Set(actual.movimientos.map(dupKey));
+
+    S.importRows.forEach(r => {
+      r.duplicado = existing.has(dupKey({ tarjeta: meta.tarjeta, fecha: r.fecha, monto: r.monto, descripcion: r.descripcion }));
+      if (r.duplicado) r.include = false;
+      const h = best(r);
+      r.categoria = (h && h.m.categoria) || guessCategoria(r.descripcion);
+      r.splits = h ? proportional(h.asig, Number(h.m.monto), r.monto) : [];
+      r.sugerido = !!(h && r.splits.length);
+    });
+  }
+
+  function drawImport() {
+    const meta = S.importMeta;
+    const rows = S.importRows;
+    const sel = rows.filter(r => r.include);
+    const tot = r2(sel.reduce((s, r) => s + (r.tipo === 'devolucion' ? -1 : 1) * r.monto, 0));
+    $('#imp-preview').innerHTML = `<div class="card table-wrap">
+      <div class="toolbar">
+        <div class="left">
+          <label>Periodo <input type="month" id="imp-periodo" value="${meta.periodo}"></label>
+          <label>Tarjeta <select id="imp-tarjeta">${S.cat.tarjetas.map(t => `<option ${t.nombre === meta.tarjeta ? 'selected' : ''}>${esc(t.nombre)}</option>`).join('')}</select></label>
+        </div>
+        <div class="right">
+          <select id="imp-bulk-resp"><option value="">Asignar seleccionados a…</option>${S.cat.responsables.filter(isActive).map(r => `<option>${esc(r.nombre)}</option>`).join('')}</select>
+          <select id="imp-bulk-cat"><option value="">Categoría a seleccionados…</option>${S.cat.categorias.filter(isActive).map(c => `<option>${esc(c.nombre)}</option>`).join('')}</select>
+        </div>
+      </div>
+      <p class="muted">${esc(meta.archivo)} · ${rows.length} filas · ${sel.length} seleccionadas · total ${fmt(tot)}${rows.some(r => r.duplicado) ? ' · <span class="badge warn">Algunas ya existen y se desmarcaron</span>' : ''}</p>
+      <table><thead><tr><th><input type="checkbox" id="imp-all" ${sel.length === rows.length ? 'checked' : ''} aria-label="Seleccionar todo"></th><th>Fecha</th><th>Descripción</th><th>Categoría</th><th>Reparto</th><th class="num">Monto</th></tr></thead>
+      <tbody>${rows.map((r, i) => `<tr data-i="${i}">
+        <td><input type="checkbox" data-k="include" ${r.include ? 'checked' : ''}></td>
+        <td>${fmtDate(r.fecha)}</td>
+        <td class="desc">${esc(r.descripcion)}<small>${[r.tipo === 'devolucion' ? 'Devolución' : '', r.duplicado ? 'Ya existe' : '', r.sugerido ? 'Reparto sugerido por historial' : ''].filter(Boolean).join(' · ')}</small></td>
+        <td><select data-k="categoria"><option value="">—</option>${S.cat.categorias.filter(isActive).map(c => `<option ${c.nombre === r.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></td>
+        <td><div class="chips">${r.splits.map(s => `<span class="chip">${esc(s.responsable)} ${fmt(s.monto)}</span>`).join('') || '<span class="muted">—</span>'}
+          <select data-k="resp" aria-label="Asignar todo a"><option value="">${r.splits.length ? 'Cambiar…' : 'Asignar a…'}</option>${S.cat.responsables.filter(isActive).map(x => `<option>${esc(x.nombre)}</option>`).join('')}</select></div></td>
+        <td class="num ${r.tipo === 'devolucion' ? 'neg' : ''}">${fmt((r.tipo === 'devolucion' ? -1 : 1) * r.monto)}</td></tr>`).join('')}</tbody></table>
+      <div class="actions" style="margin-top:1rem">
+        <button class="btn" id="imp-cancel">Cancelar</button>
+        <button class="btn primary" id="imp-go" ${sel.length ? '' : 'disabled'}>Importar ${sel.length} movimientos</button>
+      </div>
+      <p class="muted">Tip: los repartos entre varias personas (ej. Netflix a medias) se ajustan después en Movimientos → Editar, y se sugerirán automáticamente el siguiente mes.</p>
+    </div>`;
+
+    const box = $('#imp-preview');
+    box.querySelector('tbody').addEventListener('change', e => {
+      const tr = e.target.closest('tr');
+      const r = rows[Number(tr.dataset.i)];
+      const k = e.target.dataset.k;
+      if (k === 'include') r.include = e.target.checked;
+      if (k === 'categoria') r.categoria = e.target.value;
+      if (k === 'resp' && e.target.value) { r.splits = [{ responsable: e.target.value, monto: r.monto, concepto: '' }]; r.sugerido = false; }
+      drawImport();
+    });
+    $('#imp-all').onchange = e => { rows.forEach(r => { r.include = e.target.checked; }); drawImport(); };
+    $('#imp-periodo').onchange = async e => { meta.periodo = e.target.value; await applySuggestions(); drawImport(); };
+    $('#imp-tarjeta').onchange = async e => { meta.tarjeta = e.target.value; await applySuggestions(); drawImport(); };
+    $('#imp-bulk-resp').onchange = e => {
+      rows.filter(r => r.include).forEach(r => { r.splits = [{ responsable: e.target.value, monto: r.monto, concepto: '' }]; r.sugerido = false; });
+      drawImport();
+    };
+    $('#imp-bulk-cat').onchange = e => { rows.filter(r => r.include).forEach(r => { r.categoria = e.target.value; }); drawImport(); };
+    $('#imp-cancel').onclick = () => { S.importRows = null; S.importMeta = null; render(); };
+    $('#imp-go').onclick = async () => {
+      const items = rows.filter(r => r.include).map(r => {
+        const msi = parseMSI(r.descripcion);
+        return {
+          movimiento: { periodo: meta.periodo, tarjeta: meta.tarjeta, fecha: r.fecha, descripcion: r.descripcion, monto: r.monto,
+                        tipo: r.tipo, categoria: r.categoria, msi_actual: msi ? msi.actual : '', msi_total: msi ? msi.total : '', ref_id: '', notas: '' },
+          asignaciones: r.splits,
+        };
+      });
+      try {
+        const res = await api('importMovimientos', { items: items });
+        toast(res.insertados + ' movimientos importados');
+        S.importRows = null;
+        S.periodo = meta.periodo;
+        $('#f-periodo').value = S.periodo;
+        S.tab = 'movimientos';
+        await refreshCatalogs();
+        await loadPeriodo();
+      } catch (e) { toast(e.message); }
+    };
+  }
+
+  /* ============================ Excel ============================ */
+
+  function exportExcel() {
+    if (!window.XLSX) { toast('No se pudo cargar la librería de Excel'); return; }
+    const wb = XLSX.utils.book_new();
+    const movs = movsFiltradas().slice().reverse();
+    const ids = {};
+    movs.forEach(m => { ids[m.id] = m; });
+    const sign = m => (m.tipo === 'devolucion' ? -1 : 1);
+    const addSheet = (name, aoa, widths) => {
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      if (widths) ws['!cols'] = widths.map(w => ({ wch: w }));
+      XLSX.utils.book_append_sheet(wb, ws, name.replace(/[\\/?*[\]:]/g, ' ').slice(0, 31));
+    };
+    const detalle = n => S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id])
+      .map(a => { const m = ids[a.movimiento_id]; return [m.fecha, m.tarjeta, m.descripcion, a.concepto, m.categoria, m.tipo === 'devolucion' ? 'Devolución' : 'Cargo', r2(sign(m) * a.monto)]; });
+    const titulo = periodLabel(S.periodo) + (S.tarjeta !== '*' ? ' · ' + S.tarjeta : '');
+
+    if (isAdmin()) {
+      const total = r2(movs.reduce((s, m) => s + net(m), 0));
+      const lim = limiteActual();
+      const porResp = totalesPorResponsable(movs);
+      const sinAsig = r2(movs.reduce((s, m) => s + pendiente(m), 0));
+      const porCat = sumBy(movs, m => m.categoria || '(Sin categoría)', net);
+      const res = [['Resumen', titulo], [], ['Gasto neto', total], ['Límite', lim === null ? '' : lim],
+        ['Disponible', lim === null ? '' : r2(lim - total)], ['% usado', lim ? r2(total / lim * 100) : ''], [],
+        ['Responsable', 'Total a pagar']];
+      Object.entries(porResp).forEach(([k, v]) => res.push([k, v]));
+      if (sinAsig) res.push(['(Sin asignar)', sinAsig]);
+      res.push([], ['Categoría', 'Total']);
+      Object.entries(porCat).sort((a, b) => b[1] - a[1]).forEach(([k, v]) => res.push([k, v]));
+      addSheet('Resumen', res, [28, 16]);
+
+      addSheet('Movimientos', [['Fecha', 'Tarjeta', 'Descripción', 'Categoría', 'Tipo', 'Monto', 'MSI', 'Reparto', 'Sin asignar', 'Notas']]
+        .concat(movs.map(m => [m.fecha, m.tarjeta, m.descripcion, m.categoria, m.tipo === 'devolucion' ? 'Devolución' : 'Cargo', r2(net(m)),
+          m.msi_total ? m.msi_actual + '/' + m.msi_total : '', asigOf(m.id).map(a => a.responsable + ' ' + r2(a.monto)).join(', '), pendiente(m) || '', m.notas])),
+        [11, 10, 42, 18, 11, 12, 7, 40, 11, 20]);
+
+      const det = [['Responsable', 'Fecha', 'Tarjeta', 'Descripción', 'Concepto', 'Categoría', 'Tipo', 'Monto']];
+      Object.keys(porResp).forEach(n => detalle(n).forEach(r => det.push([n].concat(r))));
+      addSheet('Por responsable', det, [14, 11, 10, 42, 24, 18, 11, 12]);
+
+      S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === '*' || t.nombre === S.tarjeta)).forEach(t => {
+        const c = cuadreData(t.nombre);
+        if (!c.movs.length) return;
+        const aoa = [['Cuadre', t.nombre, periodLabel(S.periodo)], [], ['Cargos', c.cargos], ['Devoluciones', -c.devs], ['Total neto movimientos', c.neto],
+          ['Total estado de cuenta', c.estado === null ? '' : c.estado], ['Diferencia estado − movimientos', c.difEstado === null ? '' : c.difEstado], [], ['Responsable', 'Monto']];
+        Object.entries(c.porResp).forEach(([k, v]) => aoa.push([k, v]));
+        aoa.push(['Total asignado', c.asignadoTot], ['Diferencia movimientos − asignado', c.difAsig], ['Estado', Math.abs(c.difAsig) < 0.01 ? 'CUADRADO' : 'DESCUADRE']);
+        addSheet('Cuadre ' + t.nombre, aoa, [34, 16]);
+      });
+
+      Object.keys(porResp).forEach(n => {
+        const rows = detalle(n);
+        addSheet(n, [['Fecha', 'Tarjeta', 'Descripción', 'Concepto', 'Categoría', 'Tipo', 'Monto']].concat(rows)
+          .concat([[], ['', '', '', '', '', 'Total a pagar', porResp[n]]]), [11, 10, 42, 24, 18, 11, 12]);
+      });
+    } else {
+      const n = S.session.responsable;
+      const rows = detalle(n);
+      const tot = r2(rows.reduce((s, r) => s + r[6], 0));
+      addSheet('Mis cargos', [['Responsable', n, titulo], [], ['Fecha', 'Tarjeta', 'Descripción', 'Concepto', 'Categoría', 'Tipo', 'Monto']]
+        .concat(rows).concat([[], ['', '', '', '', '', 'Total a pagar', tot]]), [11, 10, 42, 24, 18, 11, 12]);
+    }
+    const who = isAdmin() ? '' : '_' + S.session.responsable;
+    XLSX.writeFile(wb, `Finance_${S.periodo}${S.tarjeta !== '*' ? '_' + S.tarjeta : ''}${who}.xlsx`);
+  }
+
+  /* ============================ Eventos globales ============================ */
+
+  document.addEventListener('click', async e => {
+    const t = e.target.closest('[data-tab],[data-act]');
+    if (!t) return;
+    if (t.dataset.tab) {
+      S.fromResumen = false;
+      if (t.dataset.tab === 'responsables') S.respFocus = '';
+      go(t.dataset.tab);
+      return;
+    }
+    const act = t.dataset.act;
+    if (act === 'close') closeModal();
+    if (act === 'drill') drill(t.dataset.kind, t.dataset.key);
+    if (act === 'back') { S.fromResumen = false; S.respFocus = ''; S.movFilter = { q: '', cat: '', resp: '', pendientes: false }; go('resumen'); }
+    if (act === 'clear-filter') {
+      const k = t.dataset.k;
+      if (k === '*') S.movFilter = { q: '', cat: '', resp: '', pendientes: false };
+      else S.movFilter[k] = k === 'pendientes' ? false : '';
+      render();
+    }
+    if (act === 'resp-focus') { S.respFocus = t.dataset.key || ''; render(); }
+    if (act === 'mis-cat') { S.misCat = ''; render(); }
+    if (act === 'new-mov') movModal(null, 'cargo');
+    if (act === 'new-dev') movModal(null, 'devolucion');
+    if (act === 'edit') movModal(S.data.movimientos.find(m => m.id === t.dataset.id));
+    if (act === 'del') {
+      const m = S.data.movimientos.find(x => x.id === t.dataset.id);
+      if (m && confirm(`¿Eliminar "${m.descripcion}" por ${fmt(m.monto)}?`)) {
+        try { await api('deleteMovimiento', { id: m.id }); toast('Eliminado'); await loadPeriodo(); } catch (err) { toast(err.message); }
+      }
+    }
+    if (act === 'cat-new') catalogModal(t.dataset.tipo);
+    if (act === 'cat-edit') catalogModal(t.dataset.tipo, S.cat[t.dataset.tipo.toLowerCase()].find(x => x.id === t.dataset.id));
+    if (act === 'lim-del') {
+      try { await api('saveLimite', { periodo: t.dataset.p, tarjeta: t.dataset.t, monto: '' }); await refreshCatalogs(); render(); } catch (err) { toast(err.message); }
+    }
+    if (act === 'user-new') userModal(null);
+    if (act === 'user-edit') userModal((S.users || []).find(u => u.usuario === t.dataset.u));
+  });
+
+  $('#login-form').addEventListener('submit', onLogin);
+  $('#btn-logout').addEventListener('click', () => logout(false));
+  $('#api-change').addEventListener('click', () => { $('#api-field').hidden = false; $('#api-change').hidden = true; $('#login-form').api.focus(); });
+
+  /* Barra lateral contraíble (se recuerda en este navegador) */
+  function setCollapsed(on) {
+    $('.app').classList.toggle('collapsed', on);
+    const b = $('#btn-collapse');
+    b.setAttribute('aria-expanded', String(!on));
+    b.title = on ? 'Expandir menú' : 'Contraer menú';
+    store.set('finance_sidebar', on ? '1' : null);
+  }
+  function initSidebar() {
+    setCollapsed(store.get('finance_sidebar') === '1');
+    $('#btn-collapse').addEventListener('click', () => setCollapsed(!$('.app').classList.contains('collapsed')));
+  }
+  $('#btn-export').addEventListener('click', exportExcel);
+  $('#f-periodo').addEventListener('change', e => { if (e.target.value) { S.periodo = e.target.value; loadPeriodo().catch(err => toast(err.message)); } });
+  $('#f-tarjeta').addEventListener('change', e => { S.tarjeta = e.target.value; render(); });
+
+  // Arranque
+  (async function init() {
+    initSidebar();
+    if (DEMO) {
+      const p = document.createElement('p');
+      p.className = 'muted';
+      p.innerHTML = '<b>Modo demo</b>: datos de ejemplo guardados solo en este navegador. Usuario <code>admin</code> / <code>admin123</code> o <code>consulta</code> / <code>consulta123</code>.';
+      $('#login-form').appendChild(p);
+    } else if (!(CFG.API_URL || '').trim()) {
+      // Sin config local: pedir (o permitir cambiar) la URL del servidor
+      const saved = store.get('finance_api');
+      $('#api-field').hidden = !!saved;
+      $('#api-change').hidden = !saved;
+      $('#login-form').api.value = saved || '';
+    }
+    S.session = loadSession();
+    if (S.session && S.session.token) {
+      try { await startApp(); return; } catch (e) { S.session = null; }
+    }
+    $('#login-view').hidden = false;
+  })();
+})();
