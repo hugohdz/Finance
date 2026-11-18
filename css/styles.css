@@ -203,6 +203,7 @@ main { min-width: 0; padding: 28px var(--gap) 28px; display: flex; flex-directio
 /* ---------- Tarjetas / paneles ---------- */
 .grid { display: grid; gap: 14px; }
 .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+.grid.cols-5 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
 @media (max-width: 420px) { .grid.cols-2 { grid-template-columns: 1fr; } }
 
@@ -307,3 +308,34 @@ dialog::backdrop { background: rgb(15 30 38 / 45%); }
 .diff-ok { color: var(--good); }
 .diff-bad { color: var(--bad); }
 .foot-note { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 11px; padding-top: 6px; }
+
+/* ---------- Alertas e indicadores en rojo ---------- */
+.card.alert-bad { border-color: color-mix(in srgb, var(--meter-bad) 55%, var(--line)); background: color-mix(in srgb, var(--bad-bg) 60%, var(--paper)); }
+.card.alert-bad .value { color: var(--bad); }
+.card.alert-bad .label { color: var(--bad); }
+.card.alert-warn { border-color: color-mix(in srgb, var(--meter-warn) 55%, var(--line)); background: color-mix(in srgb, var(--warn-bg) 55%, var(--paper)); }
+.card.alert-warn .value { color: var(--warn); }
+
+.alert-list { display: grid; gap: 6px; }
+.alert-item {
+  display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+  padding: 9px 10px 9px 12px; border-radius: var(--radius-md); border: 1px solid; font-size: 13px;
+}
+.alert-item.bad  { color: var(--bad);  background: var(--bad-bg);  border-color: color-mix(in srgb, var(--meter-bad) 40%, transparent); }
+.alert-item.warn { color: var(--warn); background: var(--warn-bg); border-color: color-mix(in srgb, var(--meter-warn) 45%, transparent); }
+.alert-item b { font-weight: 600; }
+.alert-icon {
+  display: grid; place-items: center; width: 22px; height: 22px; border-radius: 50%;
+  color: #fff; font-size: 12px; font-weight: 700;
+}
+.alert-item.bad .alert-icon { background: var(--meter-bad); }
+.alert-item.warn .alert-icon { background: var(--meter-warn); }
+.alert-item .btn { background: var(--paper); }
+
+.nav .count.bad { color: #fff; background: var(--meter-bad); border-radius: 999px; padding: 1px 6px; font-weight: 600; }
+.nav .count.good { color: var(--good); }
+.app.collapsed .nav .count.bad { background: var(--meter-bad); color: #fff; }
+
+tr.row-bad td { background: color-mix(in srgb, var(--bad-bg) 45%, transparent); }
+tr.row-bad td:first-child { box-shadow: inset 3px 0 0 var(--meter-bad); padding-left: 10px; }
+.sidebar-foot b.diff-bad, .sidebar-foot b.diff-bad + span { color: var(--bad); }

@@ -121,13 +121,7 @@
       .filter(m => S.tarjeta === '*' || m.tarjeta === S.tarjeta)
       .sort((a, b) => String(b.fecha).localeCompare(String(a.fecha)));
   }
-  function limiteActual() {
-    const L = S.cat.limites;
-    const t = S.tarjeta;
-    const find = (p, c) => L.find(l => String(l.periodo) === p && String(l.tarjeta) === c);
-    const hit = find(S.periodo, t) || find('*', t);
-    return hit ? Number(hit.monto) : null;
-  }
+  function limiteActual() { return limiteFor(S.tarjeta); }
   function sumBy(items, keyFn, valFn) {
     const out = {};
     items.forEach(i => { const k = keyFn(i) || '(Sin asignar)'; out[k] = r2((out[k] || 0) + valFn(i)); });
@@ -241,33 +235,52 @@
   ];
   const TABS_RESP = [['mis', 'Mis cargos'], ['config', 'Mi cuenta']];
 
+  /** Conteo de la barra lateral: [texto, clase] */
   function tabCount(key) {
     const movs = movsFiltradas();
-    if (key === 'movimientos' || key === 'mis') return movs.length || '';
-    if (key === 'responsables') return Object.keys(totalesPorResponsable(movs)).length || '';
-    if (key === 'cuadre') {
-      const pend = movs.filter(m => tarjetaTipo(m.tarjeta) === 'credito' && pendiente(m) !== 0).length;
-      return pend ? '!' + pend : (movs.length ? '✓' : '');
+    const alerts = S.alerts || [];
+    if (key === 'resumen') {
+      const lim = alerts.find(a => a.tipo === 'limite' && a.level === 'bad');
+      return lim ? ['!', 'bad'] : ['', ''];
     }
-    return '';
+    if (key === 'movimientos') {
+      const pend = movs.filter(m => pendiente(m) !== 0).length;
+      return [movs.length || '', pend ? 'bad' : ''];
+    }
+    if (key === 'mis') return [movs.length || '', ''];
+    if (key === 'responsables') return [Object.keys(totalesPorResponsable(movs)).length || '', ''];
+    if (key === 'cuadre') {
+      const bad = alerts.filter(a => a.tipo === 'cuadre' && a.level === 'bad').length;
+      return bad ? ['!' + bad, 'bad'] : (movs.length ? ['✓', 'good'] : ['', '']);
+    }
+    return ['', ''];
   }
 
   function renderTabs() {
     const tabs = isAdmin() ? TABS_ADMIN : TABS_RESP;
     if (!S.tab || !tabs.some(t => t[0] === S.tab)) S.tab = tabs[0][0];
     $('#tabs').innerHTML = tabs.map(t =>
-      `<button data-tab="${t[0]}" title="${t[1]}" ${t[0] === S.tab ? 'aria-current="page"' : ''}>${icon(t[0])}<span class="label">${t[1]}</span><span class="count">${tabCount(t[0])}</span></button>`).join('');
+      `<button data-tab="${t[0]}" title="${t[1]}" ${t[0] === S.tab ? 'aria-current="page"' : ''}>${icon(t[0])}<span class="label">${t[1]}</span>${(c => `<span class="count ${c[1]}">${c[0]}</span>`)(tabCount(t[0]))}</button>`).join('');
     const movs = movsFiltradas();
     const total = isAdmin() ? r2(movs.reduce((s, m) => s + net(m), 0)) : (totalesPorResponsable(movs)[S.session.responsable] || 0);
-    $('#sidebar-foot').innerHTML = `<span>${periodoTitulo()}</span><b>${fmt(total)}</b><span>${isAdmin() ? 'gasto neto' : 'a pagar'}</span>`;
+    const st = isAdmin() ? limiteStatus(total, limiteActual()) : { cls: '' };
+    $('#sidebar-foot').innerHTML = `<span>${periodoTitulo()}</span><b class="${st.cls === 'bad' ? 'diff-bad' : ''}">${fmt(total)}</b><span>${isAdmin() ? (st.cls === 'bad' ? 'gasto neto · límite rebasado' : 'gasto neto') : 'a pagar'}</span>`;
   }
 
   function render() {
+    const banner = isAdmin() && S.tab !== 'config' && S.tab !== 'importar' ? alertBanner() : '';
+    if (!banner) S.alerts = revisarAlertas();
     renderTabs();
     const main = $('#main');
     const fn = VIEWS[S.tab];
     main.innerHTML = '';
     fn(main);
+    if (banner) {
+      const head = main.querySelector('.page-head');
+      const box = document.createElement('div');
+      box.innerHTML = banner;
+      head ? head.after(box.firstElementChild) : main.prepend(box.firstElementChild);
+    }
   }
 
   function go(tab) {
@@ -281,6 +294,100 @@
       <div class="crumbs">${extra || ''}${meta ? `<span class="meta">${meta}</span>` : ''}</div></div>`;
   }
   function periodoTitulo() { return periodLabel(S.periodo) + (S.tarjeta !== '*' ? ' · ' + esc(S.tarjeta) : ''); }
+
+  /* ============================ Alertas ============================ */
+
+  /** Límite aplicable a una tarjeta ('*' = todas) en el periodo cargado. */
+  function limiteFor(tarjeta) {
+    const L = S.cat.limites;
+    const find = (p, c) => L.find(l => String(l.periodo) === p && String(l.tarjeta) === c);
+    const hit = find(S.periodo, tarjeta) || find('*', tarjeta);
+    return hit ? Number(hit.monto) : null;
+  }
+
+  /** Revisa límite, gastos sin asignar y cuadre de TODO el periodo cargado. */
+  function revisarAlertas() {
+    if (!isAdmin()) return [];
+    const out = [];
+    const all = S.data.movimientos;
+    const neto = movs => r2(movs.reduce((s, m) => s + net(m), 0));
+
+    [['*', all]].concat(S.cat.tarjetas.map(t => [t.nombre, all.filter(m => m.tarjeta === t.nombre)])).forEach(([t, movs]) => {
+      const lim = limiteFor(t);
+      if (!lim) return;
+      const total = neto(movs);
+      const st = limiteStatus(total, lim);
+      const nombre = t === '*' ? 'el límite mensual' : 'el límite de ' + esc(t);
+      if (st.cls === 'bad') out.push({ level: 'bad', tipo: 'limite', act: 'alert-go', tab: 'resumen', tarjeta: t,
+        text: `Se rebasó ${nombre} (${fmt(lim)}) por <b>${fmt(total - lim)}</b>. Gasto actual ${fmt(total)}.` });
+      else if (st.cls === 'warn') out.push({ level: 'warn', tipo: 'limite', act: 'alert-go', tab: 'resumen', tarjeta: t,
+        text: `Vas al ${st.pct.toFixed(0)}% ${t === '*' ? 'del límite mensual' : 'del límite de ' + esc(t)}: quedan <b>${fmt(lim - total)}</b>.` });
+    });
+
+    S.cat.tarjetas.forEach(t => {
+      const movs = all.filter(m => m.tarjeta === t.nombre);
+      if (!movs.length) return;
+      const pend = movs.filter(m => pendiente(m) !== 0);
+      const falta = r2(pend.reduce((s, m) => s + pendiente(m), 0));
+      if (t.tipo === 'credito') {
+        const c = cuadreData(t.nombre);
+        if (pend.length) out.push({ level: 'bad', tipo: 'cuadre', act: 'alert-go', tab: 'cuadre', tarjeta: t.nombre,
+          text: `Cuadre de ${esc(t.nombre)} incorrecto: faltan <b>${fmt(falta)}</b> por asignar a responsables (${pend.length} movimiento${pend.length > 1 ? 's' : ''}).` });
+        if (c.difEstado !== null && Math.abs(c.difEstado) >= 0.01) {
+          const porDev = c.devs && Math.abs(c.difEstado - c.devs) < 0.01;
+          out.push({ level: porDev ? 'warn' : 'bad', tipo: 'cuadre', act: 'alert-go', tab: 'cuadre', tarjeta: t.nombre,
+            text: porDev ? `Cuadre de ${esc(t.nombre)}: la diferencia de ${fmt(c.difEstado)} con el estado de cuenta corresponde a devoluciones aún no reflejadas.`
+                         : `Cuadre de ${esc(t.nombre)} incorrecto: el estado de cuenta difiere de los movimientos por <b>${fmt(c.difEstado)}</b>.` });
+        }
+      } else if (pend.length) {
+        out.push({ level: 'bad', tipo: 'pendiente', act: 'alert-pend', tarjeta: t.nombre,
+          text: `${esc(t.nombre)}: ${pend.length} gasto${pend.length > 1 ? 's' : ''} sin asignar por <b>${fmt(falta)}</b>.` });
+      }
+    });
+    return out;
+  }
+
+  const ALERT_ICON = { bad: '✕', warn: '!' };
+
+  function alertList(alerts, withButtons) {
+    return `<div class="alert-list" role="alert">${alerts.map((a, i) => `<div class="alert-item ${a.level}">
+      <span class="alert-icon" aria-hidden="true">${ALERT_ICON[a.level]}</span><span class="alert-text">${a.text}</span>
+      ${withButtons ? `<button type="button" class="btn small" data-act="${a.act}" data-i="${i}">Ver ›</button>` : ''}</div>`).join('')}</div>`;
+  }
+
+  /** Franja de alertas que se muestra arriba de las vistas del administrador. */
+  function alertBanner() {
+    const alerts = revisarAlertas();
+    S.alerts = alerts;
+    return alerts.length ? alertList(alerts, true) : '';
+  }
+
+  function goAlert(a) {
+    if (!a) return;
+    closeModal();
+    if (a.act === 'alert-pend') {
+      S.tarjeta = a.tarjeta; $('#f-tarjeta').value = a.tarjeta;
+      S.movFilter = { q: '', cat: '', resp: '', pendientes: true };
+      go('movimientos');
+      return;
+    }
+    if (a.tarjeta && a.tarjeta !== '*' && a.tab === 'cuadre') { S.tarjeta = a.tarjeta; $('#f-tarjeta').value = a.tarjeta; }
+    if (a.tipo === 'limite') { S.tarjeta = a.tarjeta; $('#f-tarjeta').value = a.tarjeta; }
+    go(a.tab);
+  }
+
+  /** Aviso después de guardar / importar gastos. */
+  function avisoTrasGuardar(origen) {
+    const alerts = revisarAlertas();
+    S.alerts = alerts;
+    if (!alerts.length) return;
+    const limite = alerts.find(a => a.tipo === 'limite' && a.level === 'bad');
+    const titulo = limite ? 'Se rebasó el límite de gasto' : alerts.some(a => a.level === 'bad') ? 'Revisa estos pendientes' : 'Atención';
+    openModal(`<div><div class="eyebrow" style="color:var(--${alerts.some(a => a.level === 'bad') ? 'bad' : 'warn'})">${origen} · ${periodLabel(S.periodo)}</div>
+      <h2 style="margin-top:6px">${titulo}</h2></div>
+      ${alertList(alerts, true)}
+      <div class="actions"><button class="btn primary" data-act="close">Entendido</button></div>`);
+  }
 
   /* ============================ Vistas ============================ */
 
@@ -329,8 +436,8 @@
   }
   function backBtn() { return S.fromResumen ? '<button class="btn small" data-act="back">‹ Volver al resumen</button>' : ''; }
 
-  function statCard(label, value, sub, extra) {
-    return `<div class="card stat"><div class="label">${label}</div><div class="value">${value}</div>
+  function statCard(label, value, sub, extra, state) {
+    return `<div class="card stat${state ? ' alert-' + state : ''}"><div class="label">${label}</div><div class="value">${value}</div>
       ${sub ? `<div class="sub">${sub}</div>` : ''}${extra || ''}</div>`;
   }
 
@@ -343,7 +450,7 @@
     return statCard('Límite mensual' + (S.tarjeta === '*' ? '' : ' · ' + esc(S.tarjeta)),
       lim ? fmt(lim) : '—',
       `<span class="badge ${st.cls}">${st.text}</span>` + (lim ? `<span>${st.pct.toFixed(0)}% usado</span>` : ''),
-      meter);
+      meter, st.cls === 'bad' || st.cls === 'warn' ? st.cls : '');
   }
 
   VIEWS.resumen = function (el) {
@@ -359,11 +466,21 @@
 
     el.innerHTML = `
       ${pageHead('Resumen del periodo', periodoTitulo(), movs.length + ' movimientos · clic en una barra para ver el detalle')}
-      <div class="grid cols-4">
+      <div class="grid cols-5">
         ${statCard('Gasto neto del periodo', fmt(total), movs.length + ' movimientos')}
         ${limiteCard(total)}
         ${statCard('Devoluciones', fmt(devs), 'Cargos brutos ' + fmt(cargos))}
-        ${statCard('Sin asignar', fmt(sinAsignar), sinAsignar ? '<span class="badge warn">! Asigna responsables</span>' : '<span class="badge good">✓ Todo asignado</span>')}
+        ${statCard('Sin asignar', fmt(sinAsignar), sinAsignar ? `<span class="badge bad">✕ ${movs.filter(m => pendiente(m) !== 0).length} por asignar</span>` : '<span class="badge good">✓ Todo asignado</span>', '', sinAsignar ? 'bad' : '')}
+        ${(() => {
+          const cu = (S.alerts || []).filter(a => a.tipo === 'cuadre');
+          const bad = cu.filter(a => a.level === 'bad').length;
+          const credit = movs.some(m => tarjetaTipo(m.tarjeta) === 'credito');
+          if (!credit) return '';
+          return statCard('Cuadre', bad ? 'Incorrecto' : cu.length ? 'Con nota' : 'Correcto',
+            bad ? `<span class="badge bad">✕ ${bad} problema${bad > 1 ? 's' : ''}</span><button class="btn small ghost" data-tab="cuadre">Ver cuadre ›</button>`
+                : cu.length ? '<span class="badge warn">! Devoluciones pendientes de reflejar</span>' : '<span class="badge good">✓ Responsables = tarjeta</span>',
+            '', bad ? 'bad' : cu.length ? 'warn' : '');
+        })()}
       </div>
       <div class="grid cols-2">
         <div class="card"><div class="card-head"><h3>Gasto por categoría</h3><span class="meta">${Object.keys(porCat).length} categorías</span></div>${barList(porCat, { total: total, kind: 'cat' })}</div>
@@ -430,13 +547,13 @@
           <tbody>${movs.map(m => {
             const pend = pendiente(m);
             const msi = m.msi_total ? `MSI ${m.msi_actual}/${m.msi_total}` : '';
-            return `<tr>
+            return `<tr class="${pend ? 'row-bad' : ''}">
               <td>${fmtDate(m.fecha)}</td>
               <td class="desc">${esc(m.descripcion)}<small>${[m.tipo === 'devolucion' ? 'Devolución' : '', msi, esc(m.notas)].filter(Boolean).join(' · ')}</small></td>
               <td>${m.categoria ? `<span class="tag">${esc(m.categoria)}</span>` : '<span class="muted">—</span>'}</td>
               ${S.tarjeta === '*' ? `<td>${esc(m.tarjeta)}</td>` : ''}
               <td><div class="chips">${asigOf(m.id).map(a => `<span class="chip" title="${esc(a.concepto)}">${esc(a.responsable)} ${fmt(a.monto)}</span>`).join('')}
-                ${pend ? `<span class="badge ${pend > 0 ? 'warn' : 'bad'}">${pend > 0 ? 'Falta' : 'Excede'} ${fmt(Math.abs(pend))}</span>` : ''}</div></td>
+                ${pend ? `<span class="badge bad">✕ ${pend > 0 ? 'Falta' : 'Excede'} ${fmt(Math.abs(pend))}</span>` : ''}</div></td>
               <td class="num ${m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(net(m))}</td>
               <td class="num"><button class="btn small ghost" data-act="edit" data-id="${m.id}">Editar</button><button class="btn small ghost danger" data-act="del" data-id="${m.id}" aria-label="Eliminar">✕</button></td>
             </tr>`;
@@ -553,7 +670,9 @@
       const okAsig = Math.abs(c.difAsig) < 0.01;
       const okEst = c.difEstado !== null && Math.abs(c.difEstado) < 0.01;
       const badge = (ok, txt) => `<span class="badge ${ok ? 'good' : 'bad'}">${ok ? '✓ ' : '✕ '}${txt}</span>`;
-      return `<div class="card table-wrap">
+      const porDev = !okEst && c.estado !== null && c.devs && Math.abs(c.difEstado - c.devs) < 0.01;
+      const state = !okAsig || (c.estado !== null && !okEst && !porDev) ? ' alert-bad' : porDev ? ' alert-warn' : '';
+      return `<div class="card table-wrap${state}">
         <div class="toolbar" style="margin-bottom:8px"><h2>${esc(t.nombre)}</h2>
           <div class="crumbs">${badge(okAsig, okAsig ? 'Responsables cuadrados' : 'Descuadre ' + fmt(c.difAsig))}
           ${c.estado === null ? '<span class="badge neutral">Captura el total del estado de cuenta</span>'
@@ -884,9 +1003,11 @@
       try {
         await api('saveMovimiento', { movimiento: mov, asignaciones: asign.map(s => ({ responsable: s.responsable, monto: Number(s.monto), concepto: s.concepto })) });
         closeModal(); toast('Guardado');
-        if (mov.periodo !== S.periodo) toast('Guardado en ' + periodLabel(mov.periodo));
+        const otroPeriodo = mov.periodo !== S.periodo;
+        if (otroPeriodo) { S.periodo = mov.periodo; $('#f-periodo').value = S.periodo; toast('Guardado en ' + periodLabel(mov.periodo)); }
         await refreshCatalogs();
         await loadPeriodo();
+        if (mov.tipo === 'cargo') avisoTrasGuardar(isNew ? 'Nuevo gasto' : 'Gasto actualizado');
       } catch (e) { toast(e.message); }
     });
   }
@@ -1091,6 +1212,7 @@
         S.tab = 'movimientos';
         await refreshCatalogs();
         await loadPeriodo();
+        avisoTrasGuardar(res.insertados + ' movimientos importados');
       } catch (e) { toast(e.message); }
     };
   }
@@ -1177,6 +1299,7 @@
     const act = t.dataset.act;
     if (act === 'close') closeModal();
     if (act === 'drill') drill(t.dataset.kind, t.dataset.key);
+    if (act === 'alert-go' || act === 'alert-pend') goAlert((S.alerts || [])[Number(t.dataset.i)]);
     if (act === 'back') { S.fromResumen = false; S.respFocus = ''; S.movFilter = { q: '', cat: '', resp: '', pendientes: false }; go('resumen'); }
     if (act === 'clear-filter') {
       const k = t.dataset.k;
