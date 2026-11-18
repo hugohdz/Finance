@@ -13,11 +13,11 @@
         { usuario: 'admin', password: 'admin123', rol: 'admin', responsable: 'Persona A', activo: true },
         { usuario: 'consulta', password: 'consulta123', rol: 'responsable', responsable: 'Persona B', activo: true },
       ],
-      Tarjetas: [{ id: uid(), nombre: 'Crédito', tipo: 'credito', activo: true }, { id: uid(), nombre: 'Débito', tipo: 'debito', activo: true }],
+      Tarjetas: [{ id: uid(), nombre: 'Crédito', tipo: 'credito', activo: true, dia_corte: 13 }, { id: uid(), nombre: 'Débito', tipo: 'debito', activo: true }],
       Responsables: ['Persona A', 'Persona B', 'Persona C'].map(cat),
       Categorias: ['Gasolina', 'Casa', 'Comida', 'Streaming', 'Entretenimiento', 'Servicios', 'Telefonía', 'Salud', 'Ropa',
         'Tecnología', 'Viajes', 'Gimnasio', 'Comisiones e intereses', 'Otros'].map(cat),
-      Movimientos: [], Asignaciones: [], Limites: [{ periodo: '*', tarjeta: '*', monto: 30000 }], EstadosCuenta: [],
+      Movimientos: [], Asignaciones: [], Limites: [{ periodo: '*', tarjeta: '*', monto: 30000 }], EstadosCuenta: [], Devolventes: [],
       sessions: {},
     };
   }
@@ -37,6 +37,7 @@
     logout(db, req) { delete db.sessions[req.token]; return true; },
     bootstrap(db, req, s) {
       return { session: s, tarjetas: db.Tarjetas, responsables: db.Responsables, categorias: db.Categorias, limites: db.Limites,
+        devolventes: (db.Devolventes || []).filter(d => s.rol === 'admin' || d.responsable === s.responsable),
         periodos: Array.from(new Set(db.Movimientos.map(m => m.periodo))).sort().reverse() };
     },
     getPeriodo(db, req, s) {
@@ -64,6 +65,7 @@
       return Object.keys(out).map(k => ({ periodo: k.split('|')[0], responsable: k.split('|')[1], total: out[k] }));
     },
     saveMovimiento(db, req, s) {
+      corte(db, req.movimiento);
       const m = Object.assign({}, req.movimiento, { monto: r2(req.movimiento.monto), creado_por: s.usuario, actualizado: new Date().toISOString() });
       if (m.id) { const i = db.Movimientos.findIndex(x => x.id === m.id); db.Movimientos[i] = Object.assign(db.Movimientos[i], m); }
       else { m.id = uid(); db.Movimientos.push(m); }
@@ -96,6 +98,15 @@
       if (req.total !== '') db.EstadosCuenta.push({ periodo: req.periodo, tarjeta: req.tarjeta, total: r2(req.total) });
       return true;
     },
+    saveDevolvente(db, req) {
+      db.Devolventes = db.Devolventes || [];
+      const d = Object.assign({}, req.devolvente);
+      if (!d.tarjeta || !d.descripcion || !d.responsable) throw new Error('Tarjeta, descripción y responsable son requeridos');
+      if (d.id) Object.assign(db.Devolventes.find(x => x.id === d.id), d);
+      else { d.id = uid(); d.activo = true; db.Devolventes.push(d); }
+      return d;
+    },
+    deleteDevolvente(db, req) { db.Devolventes = (db.Devolventes || []).filter(d => d.id !== req.id); return true; },
     listUsuarios(db) { return db.Usuarios.map(u => ({ usuario: u.usuario, rol: u.rol, responsable: u.responsable, activo: u.activo })); },
     saveUsuario(db, req) {
       const u = req.user; const name = u.usuario.toLowerCase().trim();
@@ -111,6 +122,17 @@
       row.password = req.nueva; return true;
     },
   };
+
+  function corte(db, m) {
+    if (m.tipo !== 'cargo') return;
+    const t = db.Tarjetas.find(x => x.nombre === m.tarjeta);
+    if (!t || t.tipo !== 'credito' || !Number(t.dia_corte) || Number(m.msi_actual) > 1) return;
+    const [y, mo, d] = String(m.fecha).split('-').map(Number);
+    let yy = y, mm = mo + (d > Number(t.dia_corte) ? 1 : 0);
+    if (mm > 12) { mm = 1; yy++; }
+    const esperado = yy + '-' + String(mm).padStart(2, '0');
+    if (esperado !== m.periodo) throw new Error('"' + m.descripcion + '" (' + m.fecha + ') corresponde al corte ' + esperado + ' (día de corte ' + t.dia_corte + ').');
+  }
 
   window.FinanceMock = {
     async call(req) {

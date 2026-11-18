@@ -16,7 +16,7 @@ const SESSION_HOURS = 8;
 
 const SCHEMA = {
   Usuarios:      ['usuario', 'hash', 'salt', 'rol', 'responsable', 'activo'],
-  Tarjetas:      ['id', 'nombre', 'tipo', 'activo'],
+  Tarjetas:      ['id', 'nombre', 'tipo', 'activo', 'dia_corte'],
   Responsables:  ['id', 'nombre', 'activo'],
   Categorias:    ['id', 'nombre', 'activo'],
   Movimientos:   ['id', 'periodo', 'tarjeta', 'fecha', 'descripcion', 'monto', 'tipo', 'categoria',
@@ -24,10 +24,13 @@ const SCHEMA = {
   Asignaciones:  ['id', 'movimiento_id', 'responsable', 'monto', 'concepto'],
   Limites:       ['periodo', 'tarjeta', 'monto'],
   EstadosCuenta: ['periodo', 'tarjeta', 'total', 'notas'],
+  // Saldo a favor (p. ej. devolución de una compra a MSI) que se aplica mes con mes.
+  Devolventes:   ['id', 'tarjeta', 'descripcion', 'responsable', 'categoria', 'monto_total', 'monto_mensual',
+                  'periodo_inicio', 'meses', 'notas', 'activo'],
 };
 
 const ADMIN_ONLY = ['saveMovimiento', 'deleteMovimiento', 'importMovimientos', 'saveCatalogo',
-                    'saveLimite', 'saveEstado', 'saveUsuario', 'listUsuarios'];
+                    'saveLimite', 'saveEstado', 'saveUsuario', 'listUsuarios', 'saveDevolvente', 'deleteDevolvente'];
 
 /* ============================ HTTP ============================ */
 
@@ -127,7 +130,14 @@ function sheet_(name) {
     sh.setFrozenRows(1);
     // columnas de texto que Sheets intentaría convertir (periodo, fecha)
     SCHEMA[name].forEach((h, i) => {
-      if (h === 'periodo' || h === 'fecha') sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('@');
+      if (/^periodo|^fecha/.test(h)) sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat('@');
+    });
+  } else {
+    // migración: si el esquema creció, agrega los encabezados faltantes al final
+    const width = Math.max(sh.getLastColumn(), 1);
+    const current = sh.getRange(1, 1, 1, width).getValues()[0];
+    SCHEMA[name].forEach((h, i) => {
+      if (current.indexOf(h) < 0) sh.getRange(1, i + 1).setValue(h).setFontWeight('bold');
     });
   }
   return sh;
@@ -145,7 +155,7 @@ function readTable_(name) {
         let v = r[i];
         if (v instanceof Date) {
           // Sheets convierte "2026-11" en fecha; lo regresamos a texto.
-          v = Utilities.formatDate(v, Session.getScriptTimeZone(), h === 'periodo' ? 'yyyy-MM' : 'yyyy-MM-dd');
+          v = Utilities.formatDate(v, Session.getScriptTimeZone(), /^periodo/.test(h) ? 'yyyy-MM' : 'yyyy-MM-dd');
         }
         o[h] = v;
       });
@@ -156,6 +166,7 @@ function readTable_(name) {
 function writeTable_(name, rows) {
   const sh = sheet_(name);
   const headers = SCHEMA[name];
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
   const last = sh.getLastRow();
   if (last > 1) sh.getRange(2, 1, last - 1, sh.getLastColumn()).clearContent();
   if (!rows.length) return;
@@ -191,6 +202,7 @@ const HANDLERS = {
       responsables: readTable_('Responsables'),
       categorias: readTable_('Categorias'),
       limites: readTable_('Limites'),
+      devolventes: readTable_('Devolventes').filter(d => s.rol === 'admin' || d.responsable === s.responsable),
       periodos: Object.keys(periodos).sort().reverse(),
     };
   },
@@ -237,6 +249,7 @@ const HANDLERS = {
   saveMovimiento: function (req, s) {
     const m = req.movimiento;
     validateMov_(m);
+    validateCorte_(m, readTable_('Tarjetas'));
     const asig = (req.asignaciones || []).filter(a => a.responsable && Number(a.monto) !== 0);
     const movs = readTable_('Movimientos');
     const now = new Date().toISOString();
@@ -273,9 +286,11 @@ const HANDLERS = {
   importMovimientos: function (req, s) {
     const now = new Date().toISOString();
     const movs = [], asig = [];
+    const tarjetas = readTable_('Tarjetas');
     (req.items || []).forEach(it => {
       const m = it.movimiento;
       validateMov_(m);
+      validateCorte_(m, tarjetas);
       m.id = Utilities.getUuid();
       m.monto = round2_(m.monto);
       m.creado_por = s.usuario;
@@ -338,6 +353,34 @@ const HANDLERS = {
     return true;
   },
 
+  saveDevolvente: function (req) {
+    const d = req.devolvente || {};
+    if (!d.tarjeta || !d.descripcion || !d.responsable) throw new Error('Tarjeta, descripción y responsable son requeridos');
+    if (!(Number(d.monto_total) > 0) || !(Number(d.monto_mensual) > 0)) throw new Error('Montos inválidos');
+    if (!/^\d{4}-\d{2}$/.test(String(d.periodo_inicio))) throw new Error('Periodo de inicio inválido');
+    if (!(Number(d.meses) >= 1)) throw new Error('Meses inválidos');
+    d.monto_total = round2_(d.monto_total);
+    d.monto_mensual = round2_(d.monto_mensual);
+    d.meses = Math.round(Number(d.meses));
+    const rows = readTable_('Devolventes');
+    if (d.id) {
+      const i = rows.findIndex(r => r.id === d.id);
+      if (i < 0) throw new Error('Devolvente no encontrado');
+      rows[i] = Object.assign(rows[i], d);
+    } else {
+      d.id = Utilities.getUuid().slice(0, 8);
+      if (d.activo === undefined) d.activo = true;
+      rows.push(d);
+    }
+    writeTable_('Devolventes', rows);
+    return d;
+  },
+
+  deleteDevolvente: function (req) {
+    writeTable_('Devolventes', readTable_('Devolventes').filter(d => d.id !== req.id));
+    return true;
+  },
+
   listUsuarios: function () {
     return readTable_('Usuarios').map(u => ({ usuario: u.usuario, rol: u.rol, responsable: u.responsable, activo: u.activo }));
   },
@@ -378,6 +421,28 @@ const HANDLERS = {
     return true;
   },
 };
+
+/** Periodo (mes de corte) al que pertenece una fecha: después del día de corte pasa al mes siguiente. */
+function periodoDeCorte_(fecha, dia) {
+  const p = String(fecha).slice(0, 10).split('-').map(Number);
+  let y = p[0], mo = p[1];
+  if (p[2] > Number(dia)) { mo++; if (mo > 12) { mo = 1; y++; } }
+  return y + '-' + (mo < 10 ? '0' : '') + mo;
+}
+
+/** Cargos de tarjeta de crédito con día de corte: el periodo lo determina la fecha.
+    Se exceptúan las mensualidades MSI posteriores a la primera (el banco usa la fecha de compra). */
+function validateCorte_(m, tarjetas) {
+  if (m.tipo !== 'cargo') return;
+  const t = tarjetas.find(x => x.nombre === m.tarjeta);
+  if (!t || t.tipo !== 'credito' || !Number(t.dia_corte)) return;
+  if (Number(m.msi_actual) > 1) return;
+  const esperado = periodoDeCorte_(m.fecha, t.dia_corte);
+  if (esperado !== String(m.periodo)) {
+    throw new Error('"' + m.descripcion + '" (' + m.fecha + ') corresponde al corte ' + esperado +
+      ' (día de corte ' + t.dia_corte + '). Después del corte solo se pueden registrar devoluciones en ese periodo.');
+  }
+}
 
 function validateMov_(m) {
   if (!m) throw new Error('Movimiento requerido');

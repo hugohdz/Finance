@@ -185,6 +185,7 @@
   async function startApp() {
     const boot = await api('bootstrap');
     S.cat = boot;
+    S.cat.devolventes = boot.devolventes || [];
     S.session = Object.assign(S.session, boot.session);
     $('#login-view').hidden = true;
     $('#app-view').hidden = false;
@@ -207,12 +208,14 @@
 
   async function loadPeriodo() {
     S.data = await api('getPeriodo', { periodo: S.periodo });
+    injectDevolventes();
     render();
   }
 
   async function refreshCatalogs() {
     const boot = await api('bootstrap', {}, { silent: true });
     S.cat = boot;
+    S.cat.devolventes = boot.devolventes || [];
     renderTarjetaFilter();
   }
 
@@ -294,6 +297,186 @@
       <div class="crumbs">${extra || ''}${meta ? `<span class="meta">${meta}</span>` : ''}</div></div>`;
   }
   function periodoTitulo() { return periodLabel(S.periodo) + (S.tarjeta !== '*' ? ' · ' + esc(S.tarjeta) : ''); }
+
+  /* ============================ Fecha de corte ============================ */
+
+  function tarjetaInfo(nombre) { return S.cat.tarjetas.find(t => t.nombre === nombre) || {}; }
+  function diaCorte(nombre) {
+    const t = tarjetaInfo(nombre);
+    return t.tipo === 'credito' && Number(t.dia_corte) ? Number(t.dia_corte) : null;
+  }
+  /** Mes de corte al que pertenece una fecha (después del día de corte pasa al mes siguiente). */
+  function periodoDeCorte(fecha, dia) {
+    const [y, m, d] = String(fecha).slice(0, 10).split('-').map(Number);
+    const p = y + '-' + String(m).padStart(2, '0');
+    return d > dia ? shiftPeriod(p, 1) : p;
+  }
+  function fechaCorte(periodo, dia) {
+    const [y, m] = periodo.split('-').map(Number);
+    const last = new Date(y, m, 0).getDate();
+    return periodo + '-' + String(Math.min(dia, last)).padStart(2, '0');
+  }
+  /** Rango de fechas del periodo de una tarjeta con corte: [inicio, fin]. */
+  function rangoCorte(periodo, dia) {
+    const fin = fechaCorte(periodo, dia);
+    const prev = fechaCorte(shiftPeriod(periodo, -1), dia);
+    const d = new Date(prev + 'T12:00:00'); d.setDate(d.getDate() + 1);
+    return [d.toISOString().slice(0, 10), fin];
+  }
+  /** ¿El periodo de este cargo lo determina su fecha? (crédito con corte, cargo, no es mensualidad MSI > 1) */
+  function periodoPorFecha(m) {
+    return m.tipo === 'cargo' && diaCorte(m.tarjeta) && !(Number(m.msi_actual) > 1);
+  }
+  function hoyISO() {
+    const d = new Date();
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  function corteMeta(tarjeta) {
+    const dia = diaCorte(tarjeta);
+    if (!dia) return '';
+    const [ini, fin] = rangoCorte(S.periodo, dia);
+    const cerrado = hoyISO() > fin;
+    return `<span class="tag" title="Cargos del ${fmtDate(ini)} al ${fmtDate(fin)}">Corte ${fmtDate(fin)}</span>` +
+      (cerrado ? ' <span class="tag info" title="Después del corte solo se registran devoluciones en este periodo">Cerrado · solo devoluciones</span>' : '');
+  }
+
+  /* ============================ Devolventes diferidos ============================ */
+
+  function monthsBetween(a, b) {
+    const [y1, m1] = String(a).split('-').map(Number);
+    const [y2, m2] = String(b).split('-').map(Number);
+    return (y2 - y1) * 12 + (m2 - m1);
+  }
+  /** Monto que un devolvente aplica en un periodo (o null si no aplica). */
+  function devAplicado(d, periodo) {
+    if (!isActive(d)) return null;
+    const meses = Number(d.meses), total = Number(d.monto_total), mensual = Number(d.monto_mensual);
+    const k = monthsBetween(d.periodo_inicio, periodo);
+    if (k < 0 || k >= meses) return null;
+    const previo = r2(mensual * k);
+    if (previo >= total) return null;
+    let monto = Math.min(mensual, r2(total - previo));
+    if (k === meses - 1) {
+      const resto = r2(total - previo);
+      if (Math.abs(resto - mensual) < 1) monto = resto; // ajuste de centavos en el último mes
+    }
+    return { k: k + 1, monto: r2(monto) };
+  }
+  function devSaldo(d, periodo) {
+    let aplicado = 0;
+    const n = Math.min(Number(d.meses), Math.max(0, monthsBetween(d.periodo_inicio, periodo) + 1));
+    for (let i = 0; i < n; i++) {
+      const a = devAplicado(d, shiftPeriod(d.periodo_inicio, i));
+      if (a) aplicado += a.monto;
+    }
+    return { aplicado: r2(aplicado), saldo: r2(Number(d.monto_total) - aplicado) };
+  }
+  function devFin(d) { return shiftPeriod(d.periodo_inicio, Number(d.meses) - 1); }
+
+  /** Agrega al periodo cargado los ajustes de devolventes como movimientos virtuales. */
+  function injectDevolventes() {
+    S.data.movimientos = S.data.movimientos.filter(m => !m.virtual);
+    S.data.asignaciones = S.data.asignaciones.filter(a => !a.virtual);
+    (S.cat.devolventes || []).forEach(d => {
+      const a = devAplicado(d, S.periodo);
+      if (!a) return;
+      const id = 'dv_' + d.id;
+      const sal = devSaldo(d, S.periodo);
+      S.data.movimientos.push({
+        id: id, virtual: true, devolvente_id: d.id, periodo: S.periodo, tarjeta: d.tarjeta,
+        fecha: fechaCorte(S.periodo, diaCorte(d.tarjeta) || 28), tipo: 'devolucion', categoria: d.categoria || '',
+        descripcion: 'Devolvente aplicado · ' + d.descripcion + ' (' + a.k + '/' + d.meses + ')', monto: a.monto,
+        notas: 'Saldo restante ' + fmt(sal.saldo), msi_actual: '', msi_total: '',
+      });
+      S.data.asignaciones.push({ id: id, virtual: true, movimiento_id: id, responsable: d.responsable, monto: a.monto,
+        concepto: 'Devolvente ' + d.descripcion + ' (' + a.k + '/' + d.meses + ')' });
+    });
+  }
+
+  function devolventesTable(tarjeta) {
+    const list = (S.cat.devolventes || []).filter(d => d.tarjeta === tarjeta);
+    return `<div class="card-head" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+        <h3>Devolventes (saldo a favor aplicado mes con mes)</h3>
+        <button class="btn small" data-act="dev-new" data-tarjeta="${esc(tarjeta)}">+ Devolvente</button></div>
+      ${list.length ? `<table><thead><tr><th>Descripción</th><th>Responsable</th><th>Periodo</th><th class="num">Total</th><th class="num">Este mes</th><th class="num">Saldo</th><th></th></tr></thead><tbody>
+      ${list.map(d => {
+        const a = devAplicado(d, S.periodo);
+        const sal = devSaldo(d, S.periodo);
+        return `<tr><td class="desc">${esc(d.descripcion)}<small>${fmt(d.monto_mensual)} mensual${d.notas ? ' · ' + esc(d.notas) : ''}</small></td>
+          <td>${esc(d.responsable)}</td>
+          <td>${periodLabel(d.periodo_inicio)} – ${periodLabel(devFin(d))}</td>
+          <td class="num">${fmt(d.monto_total)}</td>
+          <td class="num neg">${a ? '−' + fmt(a.monto) + ` <span class="muted">(${a.k}/${d.meses})</span>` : '<span class="muted">—</span>'}</td>
+          <td class="num">${fmt(sal.saldo)}</td>
+          <td class="num"><button class="btn small ghost" data-act="dev-edit" data-id="${d.id}">Editar</button></td></tr>`;
+      }).join('')}</tbody></table>`
+      : '<p class="muted" style="font-size:12px">Registra aquí devoluciones que se reparten en varios meses (p. ej. una devolución sobre una compra a MSI). Cada mes se descuenta automáticamente al responsable y al cuadre.</p>'}`;
+  }
+
+  function devolventeModal(d, tarjetaDefault) {
+    const isNew = !d;
+    d = d ? Object.assign({}, d) : { tarjeta: tarjetaDefault || (S.cat.tarjetas.find(t => t.tipo === 'credito') || {}).nombre, periodo_inicio: S.periodo, meses: '', monto_total: '', monto_mensual: '', responsable: '', categoria: '', descripcion: '', notas: '' };
+    const msiMovs = S.data.movimientos.filter(m => !m.virtual && m.tipo === 'cargo' && Number(m.msi_total) > 1);
+    openModal(`<div><div class="eyebrow">Saldo a favor diferido</div><h2 style="margin-top:6px">${isNew ? 'Nuevo' : 'Editar'} devolvente</h2></div>
+      <p class="muted" style="font-size:12px">Una devolución recibida en una sola exhibición que se descuenta mes con mes a quien paga la compra. No es un movimiento del estado de cuenta: en el cuadre se resta para obtener lo que aportan los responsables.</p>
+      <form id="form-dev" class="form-grid">
+        ${isNew && msiMovs.length ? `<label class="span-2">Vincular a una compra a MSI de ${periodLabel(S.periodo)} (opcional)
+          <select name="vinculo"><option value="">—</option>${msiMovs.map(m => `<option value="${m.id}">${esc(m.descripcion)} · ${fmt(m.monto)} · ${m.msi_actual}/${m.msi_total}</option>`).join('')}</select></label>` : ''}
+        <label class="span-2">Descripción <input name="descripcion" required value="${esc(d.descripcion)}" placeholder="Ej. Devolución OLED TV"></label>
+        <label>Tarjeta <select name="tarjeta">${S.cat.tarjetas.map(t => `<option ${t.nombre === d.tarjeta ? 'selected' : ''}>${esc(t.nombre)}</option>`).join('')}</select></label>
+        <label>Responsable (a quien se le descuenta) <select name="responsable" required><option value="">—</option>${S.cat.responsables.map(r => `<option ${r.nombre === d.responsable ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select></label>
+        <label>Categoría <select name="categoria"><option value="">—</option>${S.cat.categorias.map(c => `<option ${c.nombre === d.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></label>
+        <label>Monto total del devolvente <input type="number" step="0.01" min="0.01" name="monto_total" required value="${esc(d.monto_total)}"></label>
+        <label>Primer mes en que se aplica <input type="month" name="periodo_inicio" required value="${esc(d.periodo_inicio)}"></label>
+        <label>Número de meses <input type="number" min="1" step="1" name="meses" required value="${esc(d.meses)}"></label>
+        <label>Descuento mensual <input type="number" step="0.01" min="0.01" name="monto_mensual" required value="${esc(d.monto_mensual)}"></label>
+        <label class="span-2">Notas <input name="notas" value="${esc(d.notas)}"></label>
+        <p class="span-2 status-line" id="dev-preview"></p>
+        <label class="inline span-2"><input type="checkbox" name="activo" ${isNew || isActive(d) ? 'checked' : ''}> Activo</label>
+        <div class="actions span-2">
+          ${isNew ? '' : '<button type="button" class="btn danger" id="dev-del">Eliminar</button>'}
+          <button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
+      </form>`);
+    const f = $('#form-dev');
+    let mensualManual = !isNew;
+    const preview = () => {
+      const tot = r2(f.monto_total.value), n = Number(f.meses.value), men = r2(f.monto_mensual.value);
+      if (!tot || !n || !men || !f.periodo_inicio.value) { $('#dev-preview').innerHTML = ''; return; }
+      const fake = { monto_total: tot, meses: n, monto_mensual: men, periodo_inicio: f.periodo_inicio.value, activo: true };
+      const sal = devSaldo(fake, devFin(fake));
+      $('#dev-preview').innerHTML = `<span class="badge ${Math.abs(sal.saldo) < 0.01 ? 'good' : 'warn'}">${fmt(men)} por mes de ${periodLabel(fake.periodo_inicio)} a ${periodLabel(devFin(fake))} · se aplican ${fmt(sal.aplicado)}${Math.abs(sal.saldo) >= 0.01 ? ' · quedan ' + fmt(sal.saldo) + ' sin aplicar' : ''}</span>`;
+    };
+    const autoMensual = () => { if (!mensualManual && Number(f.meses.value) && Number(f.monto_total.value)) f.monto_mensual.value = r2(Number(f.monto_total.value) / Number(f.meses.value)); preview(); };
+    f.monto_total.oninput = autoMensual; f.meses.oninput = autoMensual;
+    f.monto_mensual.oninput = () => { mensualManual = true; preview(); };
+    f.periodo_inicio.oninput = preview;
+    if (f.vinculo) f.vinculo.onchange = () => {
+      const m = S.data.movimientos.find(x => x.id === f.vinculo.value);
+      if (!m) return;
+      const a = asigOf(m.id).sort((x, y) => y.monto - x.monto)[0];
+      f.descripcion.value = 'Devolvente ' + m.descripcion.replace(/\(\d{1,3}:\d{1,3}\)/, '').trim();
+      f.tarjeta.value = m.tarjeta;
+      if (a) f.responsable.value = a.responsable;
+      if (m.categoria) f.categoria.value = m.categoria;
+      f.periodo_inicio.value = S.periodo;
+      f.meses.value = Number(m.msi_total) - Number(m.msi_actual) + 1;
+      autoMensual();
+    };
+    preview();
+    if (!isNew) $('#dev-del').onclick = async () => {
+      if (!confirm('¿Eliminar el devolvente "' + d.descripcion + '"? Se quitarán sus ajustes de todos los periodos.')) return;
+      try { await api('deleteDevolvente', { id: d.id }); closeModal(); await refreshCatalogs(); await loadPeriodo(); toast('Devolvente eliminado'); }
+      catch (e) { toast(e.message); }
+    };
+    f.addEventListener('submit', async ev => {
+      ev.preventDefault();
+      const dev = { id: d.id, descripcion: f.descripcion.value.trim(), tarjeta: f.tarjeta.value, responsable: f.responsable.value,
+        categoria: f.categoria.value, monto_total: r2(f.monto_total.value), periodo_inicio: f.periodo_inicio.value,
+        meses: Number(f.meses.value), monto_mensual: r2(f.monto_mensual.value), notas: f.notas.value, activo: f.activo.checked };
+      try { await api('saveDevolvente', { devolvente: dev }); closeModal(); await refreshCatalogs(); await loadPeriodo(); toast('Devolvente guardado'); }
+      catch (e) { toast(e.message); }
+    });
+  }
 
   /* ============================ Alertas ============================ */
 
@@ -494,6 +677,15 @@
   async function renderHistorial(card) {
     try {
       const rows = await api('historial', {}, { silent: true });
+      // ajustes de devolventes (no están en la hoja de asignaciones)
+      const ps = Array.from(new Set(rows.map(r => r.periodo).concat([S.periodo])));
+      (S.cat.devolventes || []).forEach(d => ps.forEach(p => {
+        const a = devAplicado(d, p);
+        if (!a) return;
+        let row = rows.find(x => x.periodo === p && x.responsable === d.responsable);
+        if (!row) { row = { periodo: p, responsable: d.responsable, total: 0 }; rows.push(row); }
+        row.total = r2(row.total - a.monto);
+      }));
       const periodos = Array.from(new Set(rows.map(r => r.periodo))).sort().reverse().slice(0, 13);
       const resps = Array.from(new Set(rows.map(r => r.responsable))).sort();
       if (!periodos.length) { card.innerHTML = '<h3>Historial por periodo</h3><div class="empty">Sin datos</div>'; return; }
@@ -526,7 +718,7 @@
     const titulo = f.cat ? (f.cat === '__none' ? 'Sin categoría' : esc(f.cat)) : f.resp ? esc(f.resp) : f.pendientes ? 'Sin asignar' : 'Movimientos';
 
     el.innerHTML = `
-      ${pageHead('Movimientos · ' + periodoTitulo(), titulo, movs.length + ' movimientos · ' + fmt(total), backBtn())}
+      ${pageHead('Movimientos · ' + periodoTitulo(), titulo, movs.length + ' movimientos · ' + fmt(total), backBtn() + (S.tarjeta !== '*' ? corteMeta(S.tarjeta) : ''))}
       ${pills.length ? `<div class="crumbs">${pills.map(([k, t]) => `<span class="filter-pill">${esc(t)}<button type="button" data-act="clear-filter" data-k="${k}" aria-label="Quitar filtro">✕</button></span>`).join('')}
         ${pills.length > 1 ? '<button class="btn small ghost" data-act="clear-filter" data-k="*">Limpiar filtros</button>' : ''}</div>` : ''}
       <div class="toolbar">
@@ -549,13 +741,14 @@
             const msi = m.msi_total ? `MSI ${m.msi_actual}/${m.msi_total}` : '';
             return `<tr class="${pend ? 'row-bad' : ''}">
               <td>${fmtDate(m.fecha)}</td>
-              <td class="desc">${esc(m.descripcion)}<small>${[m.tipo === 'devolucion' ? 'Devolución' : '', msi, esc(m.notas)].filter(Boolean).join(' · ')}</small></td>
+              <td class="desc">${esc(m.descripcion)}<small>${[m.virtual ? 'Ajuste automático' : m.tipo === 'devolucion' ? 'Devolución' : '', msi, esc(m.notas)].filter(Boolean).join(' · ')}</small></td>
               <td>${m.categoria ? `<span class="tag">${esc(m.categoria)}</span>` : '<span class="muted">—</span>'}</td>
               ${S.tarjeta === '*' ? `<td>${esc(m.tarjeta)}</td>` : ''}
               <td><div class="chips">${asigOf(m.id).map(a => `<span class="chip" title="${esc(a.concepto)}">${esc(a.responsable)} ${fmt(a.monto)}</span>`).join('')}
                 ${pend ? `<span class="badge bad">✕ ${pend > 0 ? 'Falta' : 'Excede'} ${fmt(Math.abs(pend))}</span>` : ''}</div></td>
               <td class="num ${m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(net(m))}</td>
-              <td class="num"><button class="btn small ghost" data-act="edit" data-id="${m.id}">Editar</button><button class="btn small ghost danger" data-act="del" data-id="${m.id}" aria-label="Eliminar">✕</button></td>
+              <td class="num">${m.virtual ? `<button class="btn small ghost" data-act="dev-edit" data-id="${m.devolvente_id}" title="Ajuste automático de un devolvente">Devolvente</button>`
+                : `<button class="btn small ghost" data-act="edit" data-id="${m.id}">Editar</button><button class="btn small ghost danger" data-act="del" data-id="${m.id}" aria-label="Eliminar">✕</button>`}</td>
             </tr>`;
           }).join('')}</tbody>
           <tfoot><tr><td colspan="${S.tarjeta === '*' ? 5 : 4}">Total (${movs.length})</td><td class="num">${fmt(total)}</td><td></td></tr></tfoot>
@@ -650,19 +843,24 @@
   function cuadreData(tarjeta) {
     const movs = S.data.movimientos.filter(m => m.tarjeta === tarjeta);
     const cargos = r2(movs.filter(m => m.tipo !== 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
-    const devs = r2(movs.filter(m => m.tipo === 'devolucion').reduce((s, m) => s + Number(m.monto), 0));
-    const neto = r2(cargos - devs);
+    const devs = r2(movs.filter(m => m.tipo === 'devolucion' && !m.virtual).reduce((s, m) => s + Number(m.monto), 0));
+    const dvMovs = movs.filter(m => m.virtual);
+    const dvs = r2(dvMovs.reduce((s, m) => s + Number(m.monto), 0));
+    const neto = r2(cargos - devs);          // lo que trae el estado de cuenta
+    const aCubrir = r2(neto - dvs);          // lo que deben aportar los responsables
     const porResp = totalesPorResponsable(movs);
     const asignadoTot = r2(Object.values(porResp).reduce((s, v) => s + v, 0));
     const est = S.data.estados.find(e => e.tarjeta === tarjeta);
     const estado = est && est.total !== '' ? Number(est.total) : null;
     const pendientes = movs.filter(m => pendiente(m) !== 0);
-    return { movs, cargos, devs, neto, porResp, asignadoTot, estado, pendientes,
-             difAsig: r2(neto - asignadoTot), difEstado: estado === null ? null : r2(estado - neto) };
+    return { movs, cargos, devs, dvs, dvMovs, neto, aCubrir, porResp, asignadoTot, estado, pendientes,
+             difAsig: r2(aCubrir - asignadoTot), difEstado: estado === null ? null : r2(estado - neto) };
   }
 
   VIEWS.cuadre = function (el) {
-    const cards = S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === '*' || t.nombre === S.tarjeta));
+    const conDatos = t => S.data.movimientos.some(m => m.tarjeta === t.nombre) || S.data.estados.some(e => e.tarjeta === t.nombre)
+      || (S.cat.devolventes || []).some(d => d.tarjeta === t.nombre);
+    const cards = S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === t.nombre || (S.tarjeta === '*' && conDatos(t))));
     const head = pageHead('Cuadre de tarjeta de crédito', periodoTitulo(), 'Movimientos = responsables = estado de cuenta');
     if (!cards.length) { el.innerHTML = head + '<div class="card empty">El cuadre aplica a tarjetas de crédito. Selecciona una tarjeta de crédito.</div>'; return; }
     el.innerHTML = head + cards.map(t => {
@@ -673,24 +871,27 @@
       const porDev = !okEst && c.estado !== null && c.devs && Math.abs(c.difEstado - c.devs) < 0.01;
       const state = !okAsig || (c.estado !== null && !okEst && !porDev) ? ' alert-bad' : porDev ? ' alert-warn' : '';
       return `<div class="card table-wrap${state}">
-        <div class="toolbar" style="margin-bottom:8px"><h2>${esc(t.nombre)}</h2>
+        <div class="toolbar" style="margin-bottom:8px"><div class="crumbs"><h2>${esc(t.nombre)}</h2>${corteMeta(t.nombre)}</div>
           <div class="crumbs">${badge(okAsig, okAsig ? 'Responsables cuadrados' : 'Descuadre ' + fmt(c.difAsig))}
           ${c.estado === null ? '<span class="badge neutral">Captura el total del estado de cuenta</span>'
             : (!okEst && c.devs && Math.abs(c.difEstado - c.devs) < 0.01) ? `<span class="badge warn">! Diferencia ${fmt(c.difEstado)} = devoluciones aún no reflejadas en el estado de cuenta</span>`
             : badge(okEst, okEst ? 'Coincide con estado de cuenta' : 'Diferencia ' + fmt(c.difEstado))}</div></div>
         <table><tbody>
           <tr><td>Cargos del periodo (${c.movs.filter(m => m.tipo !== 'devolucion').length})</td><td class="num">${fmt(c.cargos)}</td></tr>
-          <tr><td>(−) Devoluciones</td><td class="num neg">${c.devs ? '−' + fmt(c.devs) : fmt(0)}</td></tr>
+          <tr><td>(−) Devoluciones en el estado de cuenta</td><td class="num neg">${c.devs ? '−' + fmt(c.devs) : fmt(0)}</td></tr>
           <tr><td><b>Total neto de movimientos</b></td><td class="num"><b>${fmt(c.neto)}</b></td></tr>
           <tr><td>Total según estado de cuenta</td><td class="num"><form class="inline-form" data-estado="${esc(t.nombre)}" style="display:flex;gap:.4rem;justify-content:flex-end">
             <input type="number" step="0.01" name="total" value="${c.estado === null ? '' : c.estado}" placeholder="0.00" style="width:130px;text-align:right">
             <button class="btn small">Guardar</button></form></td></tr>
           <tr><td>Diferencia estado de cuenta − movimientos</td><td class="num ${okEst ? 'diff-ok' : 'diff-bad'}">${c.difEstado === null ? '—' : fmt(c.difEstado)}</td></tr>
+          ${c.dvMovs.map(m => `<tr><td style="padding-left:1.5rem">(−) ${esc(m.descripcion)} <span class="muted">· ${esc(asigOf(m.id).map(a => a.responsable).join(', '))}</span></td><td class="num neg">−${fmt(m.monto)}</td></tr>`).join('')}
+          ${c.dvs ? `<tr><td><b>Total a cubrir por responsables</b> <span class="muted">(movimientos − devolventes)</span></td><td class="num"><b>${fmt(c.aCubrir)}</b></td></tr>` : ''}
           <tr><td colspan="2"><b>Suma por responsable</b></td></tr>
           ${Object.entries(c.porResp).sort((a, b) => b[1] - a[1]).map(([n, v]) => `<tr><td style="padding-left:1.5rem">${esc(n)}</td><td class="num">${fmt(v)}</td></tr>`).join('')}
           <tr><td><b>Total asignado a responsables</b></td><td class="num"><b>${fmt(c.asignadoTot)}</b></td></tr>
-          <tr><td>Diferencia movimientos − asignado</td><td class="num ${okAsig ? 'diff-ok' : 'diff-bad'}">${fmt(c.difAsig)}</td></tr>
+          <tr><td>Diferencia ${c.dvs ? 'a cubrir' : 'movimientos'} − asignado</td><td class="num ${okAsig ? 'diff-ok' : 'diff-bad'}">${fmt(c.difAsig)}</td></tr>
         </tbody></table>
+        ${devolventesTable(t.nombre)}
         ${c.pendientes.length ? `<div class="card-head" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)"><h3>Movimientos con reparto incompleto</h3><span class="meta">${c.pendientes.length}</span></div><table><tbody>${c.pendientes.map(m => `
           <tr><td>${fmtDate(m.fecha)}</td><td class="desc">${esc(m.descripcion)}</td><td class="num">${fmt(m.monto)}</td>
           <td class="num"><span class="badge warn">Pendiente ${fmt(pendiente(m))}</span></td>
@@ -772,7 +973,7 @@
           <div style="align-self:end"><button class="btn primary">Guardar límite</button></div>
         </form></div>
       <div class="grid cols-2">
-        ${catTable('Tarjetas', S.cat.tarjetas, r => r.tipo === 'credito' ? 'crédito' : 'débito')}
+        ${catTable('Tarjetas', S.cat.tarjetas, r => r.tipo === 'credito' ? 'crédito' + (Number(r.dia_corte) ? ' · corte día ' + r.dia_corte : ' · sin día de corte') : 'débito')}
         ${catTable('Responsables', S.cat.responsables)}
         ${catTable('Categorias', S.cat.categorias)}
         <div class="card table-wrap" id="users-card"><h3>Usuarios</h3><div class="muted">Cargando…</div></div>
@@ -829,7 +1030,8 @@
     openModal(`<h2>${item.id ? 'Editar' : 'Agregar'} · ${tipo}</h2>
       <form id="form-cat" class="form-grid">
         <label class="span-2">Nombre <input name="nombre" required value="${esc(item.nombre)}"></label>
-        ${tipo === 'Tarjetas' ? `<label>Tipo <select name="tipo"><option value="credito" ${item.tipo === 'credito' ? 'selected' : ''}>Crédito</option><option value="debito" ${item.tipo === 'debito' ? 'selected' : ''}>Débito</option></select></label>` : ''}
+        ${tipo === 'Tarjetas' ? `<label>Tipo <select name="tipo"><option value="credito" ${item.tipo === 'credito' ? 'selected' : ''}>Crédito</option><option value="debito" ${item.tipo === 'debito' ? 'selected' : ''}>Débito</option></select></label>
+          <label>Día de corte (crédito) <input type="number" name="dia_corte" min="1" max="31" value="${esc(item.dia_corte)}" placeholder="Ej. 13"></label>` : ''}
         <label class="inline"><input type="checkbox" name="activo" ${isActive(item) ? 'checked' : ''}> Activo</label>
         ${item.id ? '<p class="muted span-2">Cambiar el nombre no actualiza los movimientos ya capturados.</p>' : ''}
         <div class="actions span-2"><button type="button" class="btn" data-act="close">Cancelar</button><button class="btn primary">Guardar</button></div>
@@ -839,6 +1041,7 @@
       const f = ev.target;
       const it = { id: item.id, nombre: f.nombre.value.trim(), activo: f.activo.checked };
       if (f.tipo) it.tipo = f.tipo.value;
+      if (f.dia_corte) it.dia_corte = f.tipo.value === 'credito' && f.dia_corte.value ? Number(f.dia_corte.value) : '';
       try { await api('saveCatalogo', { tipo: tipo, item: it }); closeModal(); await refreshCatalogs(); render(); toast('Guardado'); }
       catch (e) { toast(e.message); }
     });
@@ -883,13 +1086,14 @@
       <form id="form-mov">
         <div class="form-grid">
           <label>Tipo <select name="tipo"><option value="cargo" ${m.tipo === 'cargo' ? 'selected' : ''}>Gasto / cargo</option><option value="devolucion" ${m.tipo === 'devolucion' ? 'selected' : ''}>Devolución / abono</option></select></label>
-          <label>Periodo (mes de corte) <input type="month" name="periodo" required value="${esc(m.periodo)}"></label>
+          <label>Periodo (mes de corte) <input type="month" name="periodo" required value="${esc(m.periodo)}"><span class="muted" id="periodo-hint"></span></label>
           <label>Tarjeta <select name="tarjeta" required>${S.cat.tarjetas.filter(t => isActive(t) || t.nombre === m.tarjeta).map(t => `<option ${t.nombre === m.tarjeta ? 'selected' : ''}>${esc(t.nombre)}</option>`).join('')}</select></label>
           <label>Fecha <input type="date" name="fecha" required value="${esc(String(m.fecha).slice(0, 10))}"></label>
           <label class="span-2">Descripción <input name="descripcion" required value="${esc(m.descripcion)}" placeholder="Ej. NETFLIX COM o LIVERPOOL (002:006)"></label>
           <label>Monto (MXN) <input type="number" name="monto" step="0.01" min="0.01" required value="${esc(m.monto)}"></label>
           <label>Categoría <select name="categoria"><option value="">—</option>${S.cat.categorias.filter(c => isActive(c) || c.nombre === m.categoria).map(c => `<option ${c.nombre === m.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></label>
           <label>MSI (mes actual / total) <span style="display:flex;gap:.3rem"><input type="number" name="msi_actual" min="0" value="${esc(m.msi_actual)}" style="width:50%"><input type="number" name="msi_total" min="0" value="${esc(m.msi_total)}" style="width:50%"></span></label>
+          <p id="dev-hint" class="span-2 muted" style="font-size:12px" ${m.tipo === 'devolucion' && isNew ? '' : 'hidden'}>¿Es un saldo a favor que se descuenta mes con mes (p. ej. sobre una compra a MSI)? <button type="button" class="btn small" data-act="dev-new">Registrar como devolvente</button></p>
           <label id="ref-wrap" class="span-2" ${m.tipo === 'devolucion' ? '' : 'hidden'}>Compra original (opcional)
             <select name="ref_id"><option value="">—</option>${cargos.map(c => `<option value="${c.id}" ${c.id === m.ref_id ? 'selected' : ''}>${fmtDate(c.fecha)} · ${esc(c.descripcion)} · ${fmt(c.monto)}</option>`).join('')}</select></label>
           <label class="span-2">Notas <input name="notas" value="${esc(m.notas)}"></label>
@@ -966,9 +1170,28 @@
       if (!splits.length) splits = [{ responsable: '', monto: '', concepto: '' }];
       drawSplits();
     };
+    // Crédito con fecha de corte: el periodo de un cargo lo define su fecha
+    const syncPeriodo = () => {
+      const probe = { tipo: form.tipo.value, tarjeta: form.tarjeta.value, msi_actual: form.msi_actual.value };
+      const dia = diaCorte(form.tarjeta.value);
+      if (periodoPorFecha(probe) && form.fecha.value) {
+        form.periodo.value = periodoDeCorte(form.fecha.value, dia);
+        form.periodo.readOnly = true;
+        $('#periodo-hint').textContent = 'Según fecha de corte (día ' + dia + ')';
+      } else {
+        if (form.periodo.readOnly) form.periodo.value = m.periodo; // deja de ser automático: vuelve al periodo original
+        form.periodo.readOnly = false;
+        $('#periodo-hint').textContent = dia && form.tipo.value === 'devolucion' ? 'Las devoluciones pueden ir en cualquier periodo' : dia ? 'Mensualidad MSI: periodo en que se cobra' : '';
+      }
+    };
+    form.fecha.addEventListener('change', syncPeriodo);
+    form.tarjeta.addEventListener('change', syncPeriodo);
+    form.msi_actual.addEventListener('input', syncPeriodo);
     form.tipo.onchange = () => {
       $('#ref-wrap').hidden = form.tipo.value !== 'devolucion';
       $('#sp-copy').hidden = form.tipo.value !== 'devolucion';
+      $('#dev-hint').hidden = !(form.tipo.value === 'devolucion' && isNew);
+      syncPeriodo();
     };
     form.ref_id.onchange = () => {
       const orig = S.data.movimientos.find(x => x.id === form.ref_id.value);
@@ -981,16 +1204,18 @@
     form.monto.oninput = status;
     form.descripcion.onblur = () => {
       const msi = parseMSI(form.descripcion.value);
-      if (msi && !form.msi_total.value) { form.msi_actual.value = msi.actual; form.msi_total.value = msi.total; }
+      if (msi && !form.msi_total.value) { form.msi_actual.value = msi.actual; form.msi_total.value = msi.total; syncPeriodo(); }
       if (!form.categoria.value) {
         const g = guessCategoria(form.descripcion.value);
         if (g) form.categoria.value = g;
       }
     };
     drawSplits();
+    syncPeriodo();
 
     form.addEventListener('submit', async ev => {
       ev.preventDefault();
+      syncPeriodo();
       const asign = splits.filter(s => s.responsable && Number(s.monto));
       const tot = r2(asign.reduce((s, x) => s + Number(x.monto), 0));
       if (tot !== montoVal() && !confirm(`El reparto (${fmt(tot)}) no coincide con el monto (${fmt(montoVal())}). ¿Guardar de todos modos?`)) return;
@@ -1132,9 +1357,13 @@
     const dupKey = m => [m.tarjeta, String(m.fecha).slice(0, 10), r2(m.monto), m.descripcion.trim().toUpperCase()].join('|');
     const existing = new Set(actual.movimientos.map(dupKey));
 
+    const dia = diaCorte(meta.tarjeta);
     S.importRows.forEach(r => {
       r.duplicado = existing.has(dupKey({ tarjeta: meta.tarjeta, fecha: r.fecha, monto: r.monto, descripcion: r.descripcion }));
-      if (r.duplicado) r.include = false;
+      const msiR = parseMSI(r.descripcion);
+      const esperado = dia && r.tipo === 'cargo' && !(msiR && msiR.actual > 1) ? periodoDeCorte(r.fecha, dia) : null;
+      r.fueraCorte = esperado && esperado !== meta.periodo ? esperado : null;
+      if (r.duplicado || r.fueraCorte) r.include = false;
       const h = best(r);
       r.categoria = (h && h.m.categoria) || guessCategoria(r.descripcion);
       r.splits = h ? proportional(h.asig, Number(h.m.monto), r.monto) : [];
@@ -1158,12 +1387,12 @@
           <select id="imp-bulk-cat"><option value="">Categoría a seleccionados…</option>${S.cat.categorias.filter(isActive).map(c => `<option>${esc(c.nombre)}</option>`).join('')}</select>
         </div>
       </div>
-      <p class="muted">${esc(meta.archivo)} · ${rows.length} filas · ${sel.length} seleccionadas · total ${fmt(tot)}${rows.some(r => r.duplicado) ? ' · <span class="badge warn">Algunas ya existen y se desmarcaron</span>' : ''}</p>
+      <p class="muted">${esc(meta.archivo)} · ${rows.length} filas · ${sel.length} seleccionadas · total ${fmt(tot)}${rows.some(r => r.duplicado) ? ' · <span class="badge warn">Algunas ya existen y se desmarcaron</span>' : ''}${rows.some(r => r.fueraCorte) ? ` · <span class="badge bad">${rows.filter(r => r.fueraCorte).length} cargos con fecha fuera del corte (día ${diaCorte(meta.tarjeta)}) se desmarcaron</span>` : ''}</p>
       <table><thead><tr><th><input type="checkbox" id="imp-all" ${sel.length === rows.length ? 'checked' : ''} aria-label="Seleccionar todo"></th><th>Fecha</th><th>Descripción</th><th>Categoría</th><th>Reparto</th><th class="num">Monto</th></tr></thead>
       <tbody>${rows.map((r, i) => `<tr data-i="${i}">
         <td><input type="checkbox" data-k="include" ${r.include ? 'checked' : ''}></td>
         <td>${fmtDate(r.fecha)}</td>
-        <td class="desc">${esc(r.descripcion)}<small>${[r.tipo === 'devolucion' ? 'Devolución' : '', r.duplicado ? 'Ya existe' : '', r.sugerido ? 'Reparto sugerido por historial' : ''].filter(Boolean).join(' · ')}</small></td>
+        <td class="desc">${esc(r.descripcion)}<small>${[r.tipo === 'devolucion' ? 'Devolución' : '', r.duplicado ? 'Ya existe' : '', r.fueraCorte ? '<span class="diff-bad">Fuera de corte: corresponde a ' + periodLabel(r.fueraCorte) + '</span>' : '', r.sugerido ? 'Reparto sugerido por historial' : ''].filter(Boolean).join(' · ')}</small></td>
         <td><select data-k="categoria"><option value="">—</option>${S.cat.categorias.filter(isActive).map(c => `<option ${c.nombre === r.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></td>
         <td><div class="chips">${r.splits.map(s => `<span class="chip">${esc(s.responsable)} ${fmt(s.monto)}</span>`).join('') || '<span class="muted">—</span>'}
           <select data-k="resp" aria-label="Asignar todo a"><option value="">${r.splits.length ? 'Cambiar…' : 'Asignar a…'}</option>${S.cat.responsables.filter(isActive).map(x => `<option>${esc(x.nombre)}</option>`).join('')}</select></div></td>
@@ -1180,12 +1409,15 @@
       const tr = e.target.closest('tr');
       const r = rows[Number(tr.dataset.i)];
       const k = e.target.dataset.k;
-      if (k === 'include') r.include = e.target.checked;
+      if (k === 'include') {
+        if (e.target.checked && r.fueraCorte) { toast('Ese cargo corresponde a ' + periodLabel(r.fueraCorte) + ' por su fecha de corte'); e.target.checked = false; return; }
+        r.include = e.target.checked;
+      }
       if (k === 'categoria') r.categoria = e.target.value;
       if (k === 'resp' && e.target.value) { r.splits = [{ responsable: e.target.value, monto: r.monto, concepto: '' }]; r.sugerido = false; }
       drawImport();
     });
-    $('#imp-all').onchange = e => { rows.forEach(r => { r.include = e.target.checked; }); drawImport(); };
+    $('#imp-all').onchange = e => { rows.forEach(r => { r.include = e.target.checked && !r.fueraCorte; }); drawImport(); };
     $('#imp-periodo').onchange = async e => { meta.periodo = e.target.value; await applySuggestions(); drawImport(); };
     $('#imp-tarjeta').onchange = async e => { meta.tarjeta = e.target.value; await applySuggestions(); drawImport(); };
     $('#imp-bulk-resp').onchange = e => {
@@ -1263,9 +1495,12 @@
         const c = cuadreData(t.nombre);
         if (!c.movs.length) return;
         const aoa = [['Cuadre', t.nombre, periodLabel(S.periodo)], [], ['Cargos', c.cargos], ['Devoluciones', -c.devs], ['Total neto movimientos', c.neto],
-          ['Total estado de cuenta', c.estado === null ? '' : c.estado], ['Diferencia estado − movimientos', c.difEstado === null ? '' : c.difEstado], [], ['Responsable', 'Monto']];
+          ['Total estado de cuenta', c.estado === null ? '' : c.estado], ['Diferencia estado − movimientos', c.difEstado === null ? '' : c.difEstado], []];
+        c.dvMovs.forEach(m => aoa.push(['(−) ' + m.descripcion, -Number(m.monto)]));
+        if (c.dvs) aoa.push(['Total a cubrir por responsables', c.aCubrir], []);
+        aoa.push(['Responsable', 'Monto']);
         Object.entries(c.porResp).forEach(([k, v]) => aoa.push([k, v]));
-        aoa.push(['Total asignado', c.asignadoTot], ['Diferencia movimientos − asignado', c.difAsig], ['Estado', Math.abs(c.difAsig) < 0.01 ? 'CUADRADO' : 'DESCUADRE']);
+        aoa.push(['Total asignado', c.asignadoTot], ['Diferencia a cubrir − asignado', c.difAsig], ['Estado', Math.abs(c.difAsig) < 0.01 ? 'CUADRADO' : 'DESCUADRE']);
         addSheet('Cuadre ' + t.nombre, aoa, [34, 16]);
       });
 
@@ -1312,6 +1547,8 @@
     if (act === 'new-mov') movModal(null, 'cargo');
     if (act === 'new-dev') movModal(null, 'devolucion');
     if (act === 'edit') movModal(S.data.movimientos.find(m => m.id === t.dataset.id));
+    if (act === 'dev-new') devolventeModal(null, t.dataset.tarjeta);
+    if (act === 'dev-edit') devolventeModal((S.cat.devolventes || []).find(d => d.id === t.dataset.id));
     if (act === 'del') {
       const m = S.data.movimientos.find(x => x.id === t.dataset.id);
       if (m && confirm(`¿Eliminar "${m.descripcion}" por ${fmt(m.monto)}?`)) {

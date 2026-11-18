@@ -11,6 +11,7 @@ Sitio estático (GitHub Pages) + backend en **Google Apps Script** que guarda la
 | 3 | **Monto por responsable** con su detalle | *Por responsable* |
 | 4 | **Cuadre** de la tarjeta de crédito: suma de responsables = total de movimientos = total del estado de cuenta | *Cuadre* |
 | 5 | **Devoluciones** ligadas a la compra original, con reparto proporcional | *Movimientos → + Devolución* |
+| 5b | **Devolventes diferidos**: devolución recibida en una sola exhibición que se descuenta mes con mes al responsable (p. ej. sobre una compra a MSI). En el cuadre: estado de cuenta − devolvente = lo que aportan los responsables | *Cuadre → + Devolvente* |
 | 6 | **Descarga a Excel** (resumen, movimientos, detalle por responsable, cuadre y una hoja por persona) | botón *Descargar Excel* |
 | 7 | **Acceso por responsable**: cada persona entra con su usuario y solo ve sus cargos e historial | *Configuración → Usuarios* |
 | + | **Importar Excel** del estado de cuenta (formato actual `Tarjetas <Mes> <Año>.xlsx`) con sugerencia automática de categoría y reparto según meses anteriores; detecta duplicados | *Importar Excel* |
@@ -18,6 +19,7 @@ Sitio estático (GitHub Pages) + backend en **Google Apps Script** que guarda la
 Conceptos:
 - **Periodo** = mes de corte del estado de cuenta (`2026-11`), independiente de la fecha de la compra.
 - **MSI** se detecta de la descripción, p. ej. `LIVERPOOL (012:013)` → 12/13.
+- **Fecha de corte** (Configuración → Tarjetas): en tarjetas de crédito el periodo de un cargo lo define su fecha; con corte el día 13, un cargo del 14 de noviembre va a diciembre. Las mensualidades MSI posteriores a la primera conservan la fecha de compra, por eso quedan exentas. Después del corte solo se registran devoluciones en ese periodo.
 - Roles: `admin` (captura y administra todo) y `responsable` (solo consulta lo suyo).
 
 ## Estructura
