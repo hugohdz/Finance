@@ -63,7 +63,16 @@
 
   <dialog id="modal"><div id="modal-body"></div></dialog>
   <div id="toast" role="status" aria-live="polite"></div>
-  <div id="loading" hidden><div class="spinner"></div></div>
+  <div id="loading" hidden role="status" aria-live="polite">
+    <div class="loader-card">
+      <div class="loader-logo">
+        <svg class="loader-ring" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="45"></circle></svg>
+        <span class="loader-mark">F</span>
+      </div>
+      <strong class="loader-brand">FINANCE</strong>
+      <span class="loader-text">Cargando<span class="loader-dots"><i>.</i><i>.</i><i>.</i></span></span>
+    </div>
+  </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
   <script src="js/config.js"></script>

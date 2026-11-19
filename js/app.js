@@ -77,7 +77,14 @@
     clearTimeout(t._h);
     t._h = setTimeout(() => t.classList.remove('show'), ms || 2600);
   }
-  function loading(on) { $('#loading').hidden = !on; }
+  // Loader con contador (varias peticiones a la vez) y retraso corto para evitar parpadeos
+  let loadingN = 0, loadingT = null;
+  function loading(on) {
+    loadingN = Math.max(0, loadingN + (on ? 1 : -1));
+    clearTimeout(loadingT);
+    if (loadingN > 0) loadingT = setTimeout(() => { $('#loading').hidden = false; }, 120);
+    else $('#loading').hidden = true;
+  }
 
   /* ============================ API ============================ */
 
