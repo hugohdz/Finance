@@ -439,7 +439,10 @@ function validateCorte_(m, tarjetas) {
   if (!t || t.tipo !== 'credito' || !Number(t.dia_corte)) return;
   if (Number(m.msi_actual) > 1) return;
   const esperado = periodoDeCorte_(m.fecha, t.dia_corte);
-  if (esperado !== String(m.periodo)) {
+  // Se permite el corte siguiente: el banco a veces registra el cargo días después de la compra.
+  const [y, mo] = esperado.split('-').map(Number);
+  const siguiente = mo === 12 ? (y + 1) + '-01' : y + '-' + ('0' + (mo + 1)).slice(-2);
+  if (esperado !== String(m.periodo) && siguiente !== String(m.periodo)) {
     throw new Error('"' + m.descripcion + '" (' + m.fecha + ') corresponde al corte ' + esperado +
       ' (día de corte ' + t.dia_corte + '). Después del corte solo se pueden registrar devoluciones en ese periodo.');
   }

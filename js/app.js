@@ -192,10 +192,23 @@
     $('#user-name').textContent = S.session.usuario + (isAdmin() ? ' · admin' : ' · ' + S.session.responsable);
     $('#user-avatar').textContent = String(S.session.responsable || S.session.usuario).charAt(0).toUpperCase();
     if (!S.periodo) S.periodo = boot.periodos[0] || currentPeriod();
-    $('#f-periodo').value = S.periodo;
+    renderPeriodoFilter();
     renderTarjetaFilter();
     renderTabs();
     await loadPeriodo();
+  }
+
+  /** Dropdown de periodo: meses con movimientos cargados (+ el actual y el seleccionado). */
+  function renderPeriodoFilter() {
+    const sel = $('#f-periodo');
+    const cargados = S.cat.periodos || [];
+    const lista = Array.from(new Set(cargados.concat([currentPeriod(), S.periodo]))).filter(Boolean).sort().reverse();
+    const porAnio = {};
+    lista.forEach(p => { (porAnio[p.slice(0, 4)] = porAnio[p.slice(0, 4)] || []).push(p); });
+    sel.innerHTML = Object.keys(porAnio).sort().reverse().map(y => `<optgroup label="${y}">${porAnio[y].map(p =>
+      `<option value="${p}">${periodLabel(p)}${cargados.indexOf(p) < 0 ? ' · sin movimientos' : ''}</option>`).join('')}</optgroup>`).join('')
+      + '<option value="__otro">Otro mes…</option>';
+    sel.value = S.periodo;
   }
 
   function renderTarjetaFilter() {
@@ -216,6 +229,7 @@
     const boot = await api('bootstrap', {}, { silent: true });
     S.cat = boot;
     S.cat.devolventes = boot.devolventes || [];
+    renderPeriodoFilter();
     renderTarjetaFilter();
   }
 
@@ -1209,12 +1223,14 @@
       const probe = { tipo: form.tipo.value, tarjeta: form.tarjeta.value, msi_actual: form.msi_actual.value };
       const dia = diaCorte(form.tarjeta.value);
       if (periodoPorFecha(probe) && form.fecha.value) {
-        form.periodo.value = periodoDeCorte(form.fecha.value, dia);
-        form.periodo.readOnly = true;
-        $('#periodo-hint').textContent = 'Según fecha de corte (día ' + dia + ')';
+        // el corte de su fecha, o el siguiente si el banco lo registró después del corte
+        const corte = periodoDeCorte(form.fecha.value, dia), sig = shiftPeriod(corte, 1);
+        if (form.periodo.value !== corte && form.periodo.value !== sig) form.periodo.value = corte;
+        form.periodo.min = corte; form.periodo.max = sig;
+        $('#periodo-hint').textContent = 'Corte día ' + dia + ': ' + periodLabel(corte) + ' (o ' + periodLabel(sig) + ' si el banco lo registró después)';
       } else {
-        if (form.periodo.readOnly) form.periodo.value = m.periodo; // deja de ser automático: vuelve al periodo original
-        form.periodo.readOnly = false;
+        if (form.periodo.min) form.periodo.value = m.periodo || form.periodo.value; // deja de ser automático
+        form.periodo.min = ''; form.periodo.max = '';
         $('#periodo-hint').textContent = dia && form.tipo.value === 'devolucion' ? 'Las devoluciones pueden ir en cualquier periodo' : dia ? 'Mensualidad MSI: periodo en que se cobra' : '';
       }
     };
@@ -1263,7 +1279,7 @@
         await api('saveMovimiento', { movimiento: mov, asignaciones: asign.map(s => ({ responsable: s.responsable, monto: Number(s.monto), concepto: s.concepto })) });
         closeModal(); toast('Guardado');
         const otroPeriodo = mov.periodo !== S.periodo;
-        if (otroPeriodo) { S.periodo = mov.periodo; $('#f-periodo').value = S.periodo; toast('Guardado en ' + periodLabel(mov.periodo)); }
+        if (otroPeriodo) { S.periodo = mov.periodo; toast('Guardado en ' + periodLabel(mov.periodo)); }
         await refreshCatalogs();
         await loadPeriodo();
         if (mov.tipo === 'cargo') avisoTrasGuardar(isNew ? 'Nuevo gasto' : 'Gasto actualizado');
@@ -1396,7 +1412,9 @@
       r.duplicado = existing.has(dupKey({ tarjeta: meta.tarjeta, fecha: r.fecha, monto: r.monto, descripcion: r.descripcion }));
       const msiR = parseMSI(r.descripcion);
       const esperado = dia && r.tipo === 'cargo' && !(msiR && msiR.actual > 1) ? periodoDeCorte(r.fecha, dia) : null;
-      r.fueraCorte = esperado && esperado !== meta.periodo ? esperado : null;
+      // el corte siguiente es válido: el banco registró el cargo después de la fecha de compra
+      r.tardio = !!esperado && shiftPeriod(esperado, 1) === meta.periodo;
+      r.fueraCorte = esperado && esperado !== meta.periodo && !r.tardio ? esperado : null;
       if (r.duplicado || r.fueraCorte) r.include = false;
       const h = best(r);
       r.categoria = (h && h.m.categoria) || guessCategoria(r.descripcion);
@@ -1426,7 +1444,7 @@
       <tbody>${rows.map((r, i) => `<tr data-i="${i}">
         <td><input type="checkbox" data-k="include" ${r.include ? 'checked' : ''}></td>
         <td>${fmtDate(r.fecha)}</td>
-        <td class="desc">${esc(r.descripcion)}<small>${[r.tipo === 'devolucion' ? 'Devolución' : '', r.duplicado ? 'Ya existe' : '', r.fueraCorte ? '<span class="diff-bad">Fuera de corte: corresponde a ' + periodLabel(r.fueraCorte) + '</span>' : '', r.sugerido ? 'Reparto sugerido por historial' : ''].filter(Boolean).join(' · ')}</small></td>
+        <td class="desc">${esc(r.descripcion)}<small>${[r.tipo === 'devolucion' ? 'Devolución' : '', r.duplicado ? 'Ya existe' : '', r.fueraCorte ? '<span class="diff-bad">Fuera de corte: corresponde a ' + periodLabel(r.fueraCorte) + '</span>' : '', r.tardio ? 'Registrado por el banco después del corte' : '', r.sugerido ? 'Reparto sugerido por historial' : ''].filter(Boolean).join(' · ')}</small></td>
         <td><select data-k="categoria"><option value="">—</option>${S.cat.categorias.filter(isActive).map(c => `<option ${c.nombre === r.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></td>
         <td><div class="chips">${r.splits.map(s => `<span class="chip">${esc(s.responsable)} ${fmt(s.monto)}</span>`).join('') || '<span class="muted">—</span>'}
           <select data-k="resp" aria-label="Asignar todo a"><option value="">${r.splits.length ? 'Cambiar…' : 'Asignar a…'}</option>${S.cat.responsables.filter(isActive).map(x => `<option>${esc(x.nombre)}</option>`).join('')}</select></div></td>
@@ -1474,7 +1492,6 @@
         toast(res.insertados + ' movimientos importados');
         S.importRows = null;
         S.periodo = meta.periodo;
-        $('#f-periodo').value = S.periodo;
         S.tab = 'movimientos';
         await refreshCatalogs();
         await loadPeriodo();
@@ -1621,7 +1638,18 @@
     $('#btn-collapse').addEventListener('click', () => setCollapsed(!$('.app').classList.contains('collapsed')));
   }
   $('#btn-export').addEventListener('click', exportExcel);
-  $('#f-periodo').addEventListener('change', e => { if (e.target.value) { S.periodo = e.target.value; loadPeriodo().catch(err => toast(err.message)); } });
+  $('#f-periodo').addEventListener('change', e => {
+    let p = e.target.value;
+    if (p === '__otro') {
+      const r = prompt('Mes a consultar o capturar (AAAA-MM):', shiftPeriod(S.periodo, 1));
+      p = r && /^\d{4}-(0[1-9]|1[0-2])$/.test(r.trim()) ? r.trim() : '';
+      if (r && !p) toast('Formato inválido, usa AAAA-MM (ej. 2026-12)');
+    }
+    if (!p) { e.target.value = S.periodo; return; }
+    S.periodo = p;
+    renderPeriodoFilter();
+    loadPeriodo().catch(err => toast(err.message));
+  });
   $('#f-tarjeta').addEventListener('change', e => { S.tarjeta = e.target.value; render(); });
 
   // Arranque

@@ -131,7 +131,8 @@
     let yy = y, mm = mo + (d > Number(t.dia_corte) ? 1 : 0);
     if (mm > 12) { mm = 1; yy++; }
     const esperado = yy + '-' + String(mm).padStart(2, '0');
-    if (esperado !== m.periodo) throw new Error('"' + m.descripcion + '" (' + m.fecha + ') corresponde al corte ' + esperado + ' (día de corte ' + t.dia_corte + ').');
+    const sig = mm === 12 ? (yy + 1) + '-01' : yy + '-' + String(mm + 1).padStart(2, '0');
+    if (esperado !== m.periodo && sig !== m.periodo) throw new Error('"' + m.descripcion + '" (' + m.fecha + ') corresponde al corte ' + esperado + ' (día de corte ' + t.dia_corte + ').');
   }
 
   window.FinanceMock = {
