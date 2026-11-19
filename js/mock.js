@@ -22,7 +22,25 @@
     };
   }
   function load() {
-    try { return JSON.parse(localStorage.getItem(KEY)) || seed(); } catch (e) { return seed(); }
+    let db;
+    try { db = JSON.parse(localStorage.getItem(KEY)) || seed(); } catch (e) { db = seed(); }
+    return datosLocales(db);
+  }
+  /** Si existe js/demo-data.local.js (ignorado por git), carga esos meses en el demo una sola vez. */
+  function datosLocales(db) {
+    const L = window.FINANCE_DEMO_DATA;
+    if (!L || db.demoVersion === L.version) return db;
+    db = seed();
+    db.demoVersion = L.version;
+    const ses = { usuario: 'seed', rol: 'admin' };
+    (L.tarjetas || []).forEach(t => { db.Tarjetas.push(Object.assign({ id: uid(), activo: true }, t)); });
+    (L.responsables || []).forEach(n => { db.Responsables.push({ id: uid(), nombre: n, activo: true }); });
+    if (L.responsables && L.responsables[0]) db.Usuarios[0].responsable = L.responsables[0];
+    H.importMovimientos(db, { items: L.items || [] }, ses);
+    (L.estados || []).forEach(e => H.saveEstado(db, e));
+    (L.devolventes || []).forEach(d => H.saveDevolvente(db, { devolvente: d }));
+    save(db);
+    return db;
   }
   function save(db) { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* ignore */ } }
 
