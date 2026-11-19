@@ -347,20 +347,34 @@
     const [y2, m2] = String(b).split('-').map(Number);
     return (y2 - y1) * 12 + (m2 - m1);
   }
-  /** Monto que un devolvente aplica en un periodo (o null si no aplica). */
+  /** Mensualidad i (0-based) del calendario del devolvente; la última ajusta centavos para cerrar exacto. */
+  function devCuota(d, i) {
+    const meses = Number(d.meses), total = Number(d.monto_total), mensual = Number(d.monto_mensual);
+    if (i < 0 || i >= meses) return 0;
+    const previo = r2(mensual * i);
+    if (previo >= total) return 0;
+    let monto = Math.min(mensual, r2(total - previo));
+    if (i === meses - 1) {
+      const resto = r2(total - previo);
+      if (Math.abs(resto - mensual) < 1) monto = resto;
+    }
+    return r2(monto);
+  }
+  function devLlegada(d) { return d.periodo_llegada && monthsBetween(d.periodo_inicio, d.periodo_llegada) > 0 ? d.periodo_llegada : d.periodo_inicio; }
+  /** Monto que un devolvente aplica en un periodo (o null). En el mes de llegada se aplican también los meses atrasados. */
   function devAplicado(d, periodo) {
     if (!isActive(d)) return null;
-    const meses = Number(d.meses), total = Number(d.monto_total), mensual = Number(d.monto_mensual);
+    const meses = Number(d.meses);
     const k = monthsBetween(d.periodo_inicio, periodo);
-    if (k < 0 || k >= meses) return null;
-    const previo = r2(mensual * k);
-    if (previo >= total) return null;
-    let monto = Math.min(mensual, r2(total - previo));
-    if (k === meses - 1) {
-      const resto = r2(total - previo);
-      if (Math.abs(resto - mensual) < 1) monto = resto; // ajuste de centavos en el último mes
+    const kL = Math.min(monthsBetween(d.periodo_inicio, devLlegada(d)), meses - 1);
+    if (k < kL || k >= meses) return null;
+    if (k === kL && kL > 0) {
+      let monto = 0;
+      for (let i = 0; i <= kL; i++) monto += devCuota(d, i);
+      return monto ? { k: '1–' + (kL + 1), monto: r2(monto), atrasados: kL } : null;
     }
-    return { k: k + 1, monto: r2(monto) };
+    const monto = devCuota(d, k);
+    return monto ? { k: String(k + 1), monto: monto } : null;
   }
   function devSaldo(d, periodo) {
     let aplicado = 0;
@@ -396,15 +410,15 @@
   function devolventesTable(tarjeta) {
     const list = (S.cat.devolventes || []).filter(d => d.tarjeta === tarjeta);
     return `<div class="card-head" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
-        <h3>Devolventes (saldo a favor aplicado mes con mes)</h3>
+        <h3>Devolventes · los paga el banco (saldo a favor aplicado mes con mes)</h3>
         <button class="btn small" data-act="dev-new" data-tarjeta="${esc(tarjeta)}">+ Devolvente</button></div>
-      ${list.length ? `<table><thead><tr><th>Descripción</th><th>Responsable</th><th>Periodo</th><th class="num">Total</th><th class="num">Este mes</th><th class="num">Saldo</th><th></th></tr></thead><tbody>
+      ${list.length ? `<table><thead><tr><th>Descripción</th><th>Se descuenta a</th><th>Calendario</th><th class="num">Total</th><th class="num">Este mes</th><th class="num">Saldo</th><th></th></tr></thead><tbody>
       ${list.map(d => {
         const a = devAplicado(d, S.periodo);
         const sal = devSaldo(d, S.periodo);
         return `<tr><td class="desc">${esc(d.descripcion)}<small>${fmt(d.monto_mensual)} mensual${d.notas ? ' · ' + esc(d.notas) : ''}</small></td>
           <td>${esc(d.responsable)}</td>
-          <td>${periodLabel(d.periodo_inicio)} – ${periodLabel(devFin(d))}</td>
+          <td>${periodLabel(d.periodo_inicio)} – ${periodLabel(devFin(d))}${devLlegada(d) !== d.periodo_inicio ? `<small class="muted" style="display:block">llegó en ${periodLabel(devLlegada(d))}</small>` : ''}</td>
           <td class="num">${fmt(d.monto_total)}</td>
           <td class="num neg">${a ? '−' + fmt(a.monto) + ` <span class="muted">(${a.k}/${d.meses})</span>` : '<span class="muted">—</span>'}</td>
           <td class="num">${fmt(sal.saldo)}</td>
@@ -427,7 +441,8 @@
         <label>Responsable (a quien se le descuenta) <select name="responsable" required><option value="">—</option>${S.cat.responsables.map(r => `<option ${r.nombre === d.responsable ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select></label>
         <label>Categoría <select name="categoria"><option value="">—</option>${S.cat.categorias.map(c => `<option ${c.nombre === d.categoria ? 'selected' : ''}>${esc(c.nombre)}</option>`).join('')}</select></label>
         <label>Monto total del devolvente <input type="number" step="0.01" min="0.01" name="monto_total" required value="${esc(d.monto_total)}"></label>
-        <label>Primer mes en que se aplica <input type="month" name="periodo_inicio" required value="${esc(d.periodo_inicio)}"></label>
+        <label>Primer mes del calendario (mensualidad 1) <input type="month" name="periodo_inicio" required value="${esc(d.periodo_inicio)}"></label>
+        <label>Mes en que llegó el devolvente <input type="month" name="periodo_llegada" value="${esc(d.periodo_llegada || d.periodo_inicio)}"><span class="muted">Si llegó después, ese mes se aplican de golpe los meses atrasados</span></label>
         <label>Número de meses <input type="number" min="1" step="1" name="meses" required value="${esc(d.meses)}"></label>
         <label>Descuento mensual <input type="number" step="0.01" min="0.01" name="monto_mensual" required value="${esc(d.monto_mensual)}"></label>
         <label class="span-2">Notas <input name="notas" value="${esc(d.notas)}"></label>
@@ -442,14 +457,16 @@
     const preview = () => {
       const tot = r2(f.monto_total.value), n = Number(f.meses.value), men = r2(f.monto_mensual.value);
       if (!tot || !n || !men || !f.periodo_inicio.value) { $('#dev-preview').innerHTML = ''; return; }
-      const fake = { monto_total: tot, meses: n, monto_mensual: men, periodo_inicio: f.periodo_inicio.value, activo: true };
+      const fake = { monto_total: tot, meses: n, monto_mensual: men, periodo_inicio: f.periodo_inicio.value, periodo_llegada: f.periodo_llegada.value, activo: true };
       const sal = devSaldo(fake, devFin(fake));
-      $('#dev-preview').innerHTML = `<span class="badge ${Math.abs(sal.saldo) < 0.01 ? 'good' : 'warn'}">${fmt(men)} por mes de ${periodLabel(fake.periodo_inicio)} a ${periodLabel(devFin(fake))} · se aplican ${fmt(sal.aplicado)}${Math.abs(sal.saldo) >= 0.01 ? ' · quedan ' + fmt(sal.saldo) + ' sin aplicar' : ''}</span>`;
+      const first = devAplicado(fake, devLlegada(fake));
+      $('#dev-preview').innerHTML = `<span class="badge ${Math.abs(sal.saldo) < 0.01 ? 'good' : 'warn'}">${first && first.atrasados ? `${periodLabel(devLlegada(fake))}: ${fmt(first.monto)} (mensualidades ${first.k}) · después ` : ''}${fmt(men)} por mes hasta ${periodLabel(devFin(fake))} · total ${fmt(sal.aplicado)}${Math.abs(sal.saldo) >= 0.01 ? ' · quedan ' + fmt(sal.saldo) + ' sin aplicar' : ' ✓'}</span>`;
     };
     const autoMensual = () => { if (!mensualManual && Number(f.meses.value) && Number(f.monto_total.value)) f.monto_mensual.value = r2(Number(f.monto_total.value) / Number(f.meses.value)); preview(); };
     f.monto_total.oninput = autoMensual; f.meses.oninput = autoMensual;
     f.monto_mensual.oninput = () => { mensualManual = true; preview(); };
     f.periodo_inicio.oninput = preview;
+    f.periodo_llegada.oninput = preview;
     if (f.vinculo) f.vinculo.onchange = () => {
       const m = S.data.movimientos.find(x => x.id === f.vinculo.value);
       if (!m) return;
@@ -458,8 +475,10 @@
       f.tarjeta.value = m.tarjeta;
       if (a) f.responsable.value = a.responsable;
       if (m.categoria) f.categoria.value = m.categoria;
-      f.periodo_inicio.value = S.periodo;
-      f.meses.value = Number(m.msi_total) - Number(m.msi_actual) + 1;
+      // calendario completo de la compra: mensualidad 1 = periodo actual − (actual − 1); llegó este mes
+      f.periodo_inicio.value = shiftPeriod(S.periodo, -(Number(m.msi_actual) - 1));
+      f.periodo_llegada.value = S.periodo;
+      f.meses.value = Number(m.msi_total);
       autoMensual();
     };
     preview();
@@ -472,6 +491,7 @@
       ev.preventDefault();
       const dev = { id: d.id, descripcion: f.descripcion.value.trim(), tarjeta: f.tarjeta.value, responsable: f.responsable.value,
         categoria: f.categoria.value, monto_total: r2(f.monto_total.value), periodo_inicio: f.periodo_inicio.value,
+        periodo_llegada: f.periodo_llegada.value && f.periodo_llegada.value > f.periodo_inicio.value ? f.periodo_llegada.value : '',
         meses: Number(f.meses.value), monto_mensual: r2(f.monto_mensual.value), notas: f.notas.value, activo: f.activo.checked };
       try { await api('saveDevolvente', { devolvente: dev }); closeModal(); await refreshCatalogs(); await loadPeriodo(); toast('Devolvente guardado'); }
       catch (e) { toast(e.message); }
@@ -853,7 +873,8 @@
     const est = S.data.estados.find(e => e.tarjeta === tarjeta);
     const estado = est && est.total !== '' ? Number(est.total) : null;
     const pendientes = movs.filter(m => pendiente(m) !== 0);
-    return { movs, cargos, devs, dvs, dvMovs, neto, aCubrir, porResp, asignadoTot, estado, pendientes,
+    const porCat = sumBy(movs.filter(m => !m.virtual), m => m.categoria || '(Sin categoría)', net);
+    return { movs, cargos, devs, dvs, dvMovs, neto, aCubrir, porResp, porCat, asignadoTot, estado, pendientes,
              difAsig: r2(aCubrir - asignadoTot), difEstado: estado === null ? null : r2(estado - neto) };
   }
 
@@ -861,7 +882,7 @@
     const conDatos = t => S.data.movimientos.some(m => m.tarjeta === t.nombre) || S.data.estados.some(e => e.tarjeta === t.nombre)
       || (S.cat.devolventes || []).some(d => d.tarjeta === t.nombre);
     const cards = S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === t.nombre || (S.tarjeta === '*' && conDatos(t))));
-    const head = pageHead('Cuadre de tarjeta de crédito', periodoTitulo(), 'Movimientos = responsables = estado de cuenta');
+    const head = pageHead('Cuadre de tarjeta de crédito', periodoTitulo(), 'Responsables + banco = estado de cuenta por categoría');
     if (!cards.length) { el.innerHTML = head + '<div class="card empty">El cuadre aplica a tarjetas de crédito. Selecciona una tarjeta de crédito.</div>'; return; }
     el.innerHTML = head + cards.map(t => {
       const c = cuadreData(t.nombre);
@@ -872,25 +893,38 @@
       const state = !okAsig || (c.estado !== null && !okEst && !porDev) ? ' alert-bad' : porDev ? ' alert-warn' : '';
       return `<div class="card table-wrap${state}">
         <div class="toolbar" style="margin-bottom:8px"><div class="crumbs"><h2>${esc(t.nombre)}</h2>${corteMeta(t.nombre)}</div>
-          <div class="crumbs">${badge(okAsig, okAsig ? 'Responsables cuadrados' : 'Descuadre ' + fmt(c.difAsig))}
+          <div class="crumbs">${badge(okAsig, okAsig ? 'Cuadrado' : 'Descuadre ' + fmt(c.difAsig))}
           ${c.estado === null ? '<span class="badge neutral">Captura el total del estado de cuenta</span>'
             : (!okEst && c.devs && Math.abs(c.difEstado - c.devs) < 0.01) ? `<span class="badge warn">! Diferencia ${fmt(c.difEstado)} = devoluciones aún no reflejadas en el estado de cuenta</span>`
             : badge(okEst, okEst ? 'Coincide con estado de cuenta' : 'Diferencia ' + fmt(c.difEstado))}</div></div>
-        <table><tbody>
-          <tr><td>Cargos del periodo (${c.movs.filter(m => m.tipo !== 'devolucion').length})</td><td class="num">${fmt(c.cargos)}</td></tr>
-          <tr><td>(−) Devoluciones en el estado de cuenta</td><td class="num neg">${c.devs ? '−' + fmt(c.devs) : fmt(0)}</td></tr>
-          <tr><td><b>Total neto de movimientos</b></td><td class="num"><b>${fmt(c.neto)}</b></td></tr>
-          <tr><td>Total según estado de cuenta</td><td class="num"><form class="inline-form" data-estado="${esc(t.nombre)}" style="display:flex;gap:.4rem;justify-content:flex-end">
-            <input type="number" step="0.01" name="total" value="${c.estado === null ? '' : c.estado}" placeholder="0.00" style="width:130px;text-align:right">
-            <button class="btn small">Guardar</button></form></td></tr>
-          <tr><td>Diferencia estado de cuenta − movimientos</td><td class="num ${okEst ? 'diff-ok' : 'diff-bad'}">${c.difEstado === null ? '—' : fmt(c.difEstado)}</td></tr>
-          ${c.dvMovs.map(m => `<tr><td style="padding-left:1.5rem">(−) ${esc(m.descripcion)} <span class="muted">· ${esc(asigOf(m.id).map(a => a.responsable).join(', '))}</span></td><td class="num neg">−${fmt(m.monto)}</td></tr>`).join('')}
-          ${c.dvs ? `<tr><td><b>Total a cubrir por responsables</b> <span class="muted">(movimientos − devolventes)</span></td><td class="num"><b>${fmt(c.aCubrir)}</b></td></tr>` : ''}
-          <tr><td colspan="2"><b>Suma por responsable</b></td></tr>
-          ${Object.entries(c.porResp).sort((a, b) => b[1] - a[1]).map(([n, v]) => `<tr><td style="padding-left:1.5rem">${esc(n)}</td><td class="num">${fmt(v)}</td></tr>`).join('')}
-          <tr><td><b>Total asignado a responsables</b></td><td class="num"><b>${fmt(c.asignadoTot)}</b></td></tr>
-          <tr><td>Diferencia ${c.dvs ? 'a cubrir' : 'movimientos'} − asignado</td><td class="num ${okAsig ? 'diff-ok' : 'diff-bad'}">${fmt(c.difAsig)}</td></tr>
-        </tbody></table>
+        <div class="estado-row">
+          <span>Total del estado de cuenta (banco)</span>
+          <form class="inline-form" data-estado="${esc(t.nombre)}">
+            <input type="number" step="0.01" name="total" value="${c.estado === null ? '' : c.estado}" placeholder="0.00" aria-label="Total del estado de cuenta">
+            <button class="btn small">Guardar</button></form>
+          <span class="num ${c.estado === null ? 'muted' : okEst ? 'diff-ok' : 'diff-bad'}">${c.estado === null ? 'sin capturar' : okEst ? '✓ coincide con los movimientos' : 'diferencia ' + fmt(c.difEstado)}</span>
+        </div>
+        <div class="cuadre-grid">
+          <div class="cuadre-col">
+            <div class="card-head"><h3>¿Quién lo paga?</h3><span class="meta">responsables + banco</span></div>
+            <table><tbody>
+              ${Object.entries(c.porResp).sort((x, y) => y[1] - x[1]).map(([n, v]) => `<tr><td><button class="link" data-act="drill" data-kind="resp" data-key="${esc(n)}">${esc(n)}</button></td><td class="num">${fmt(v)}</td></tr>`).join('')}
+              ${c.dvMovs.length ? `<tr class="bank-row"><td>Banco · devolventes<small>${c.dvMovs.map(m => esc(m.descripcion.replace('Devolvente aplicado · ', ''))).join('<br>')}</small></td><td class="num">${fmt(c.dvs)}</td></tr>` : ''}
+              ${c.difAsig > 0.009 ? `<tr class="row-bad"><td>(Sin asignar)</td><td class="num">${fmt(c.difAsig)}</td></tr>` : ''}
+            </tbody>
+            <tfoot><tr><td>Total</td><td class="num">${fmt(r2(c.asignadoTot + c.dvs + Math.max(0, c.difAsig)))}</td></tr></tfoot></table>
+          </div>
+          <div class="cuadre-col">
+            <div class="card-head"><h3>Estado de cuenta por categoría</h3><span class="meta">${c.movs.filter(m => !m.virtual).length} movimientos</span></div>
+            <table><tbody>
+              ${Object.entries(c.porCat).sort((x, y) => y[1] - x[1]).map(([n, v]) => `<tr><td><button class="link" data-act="drill" data-kind="cat" data-key="${esc(n)}">${esc(n)}</button></td><td class="num ${v < 0 ? 'neg' : ''}">${fmt(v)}</td></tr>`).join('')}
+            </tbody>
+            <tfoot><tr><td>Total</td><td class="num">${fmt(c.neto)}</td></tr></tfoot></table>
+          </div>
+        </div>
+        <div class="cuadre-result ${okAsig ? 'ok' : 'bad'}">
+          ${okAsig ? `✓ Cuadrado: ambos lados suman ${fmt(c.neto)}` : `✕ Descuadre de ${fmt(Math.abs(c.difAsig))}: ${c.difAsig > 0 ? 'faltan movimientos por asignar a responsables' : 'lo asignado supera al estado de cuenta'}`}
+        </div>
         ${devolventesTable(t.nombre)}
         ${c.pendientes.length ? `<div class="card-head" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)"><h3>Movimientos con reparto incompleto</h3><span class="meta">${c.pendientes.length}</span></div><table><tbody>${c.pendientes.map(m => `
           <tr><td>${fmtDate(m.fecha)}</td><td class="desc">${esc(m.descripcion)}</td><td class="num">${fmt(m.monto)}</td>
@@ -1494,14 +1528,20 @@
       S.cat.tarjetas.filter(t => t.tipo === 'credito' && (S.tarjeta === '*' || t.nombre === S.tarjeta)).forEach(t => {
         const c = cuadreData(t.nombre);
         if (!c.movs.length) return;
-        const aoa = [['Cuadre', t.nombre, periodLabel(S.periodo)], [], ['Cargos', c.cargos], ['Devoluciones', -c.devs], ['Total neto movimientos', c.neto],
-          ['Total estado de cuenta', c.estado === null ? '' : c.estado], ['Diferencia estado − movimientos', c.difEstado === null ? '' : c.difEstado], []];
-        c.dvMovs.forEach(m => aoa.push(['(−) ' + m.descripcion, -Number(m.monto)]));
-        if (c.dvs) aoa.push(['Total a cubrir por responsables', c.aCubrir], []);
-        aoa.push(['Responsable', 'Monto']);
-        Object.entries(c.porResp).forEach(([k, v]) => aoa.push([k, v]));
-        aoa.push(['Total asignado', c.asignadoTot], ['Diferencia a cubrir − asignado', c.difAsig], ['Estado', Math.abs(c.difAsig) < 0.01 ? 'CUADRADO' : 'DESCUADRE']);
-        addSheet('Cuadre ' + t.nombre, aoa, [34, 16]);
+        const left = Object.entries(c.porResp).sort((x, y) => y[1] - x[1]);
+        if (c.dvs) left.push(['Banco · devolventes', c.dvs]);
+        if (c.difAsig > 0.009) left.push(['(Sin asignar)', c.difAsig]);
+        const right = Object.entries(c.porCat).sort((x, y) => y[1] - x[1]);
+        const aoa = [['Cuadre', t.nombre, periodLabel(S.periodo)], [],
+          ['Total estado de cuenta (banco)', c.estado === null ? '' : c.estado, '', 'Total movimientos', c.neto], [],
+          ['¿Quién lo paga?', 'Monto', '', 'Categoría (estado de cuenta)', 'Monto']];
+        for (let i = 0; i < Math.max(left.length, right.length); i++) {
+          aoa.push([(left[i] || [])[0] || '', (left[i] || [])[1] === undefined ? '' : left[i][1], '', (right[i] || [])[0] || '', (right[i] || [])[1] === undefined ? '' : right[i][1]]);
+        }
+        aoa.push(['Total', r2(left.reduce((x, e) => x + e[1], 0)), '', 'Total', c.neto], [],
+          ['Estado', Math.abs(c.difAsig) < 0.01 ? 'CUADRADO' : 'DESCUADRE ' + c.difAsig]);
+        c.dvMovs.forEach(m => aoa.push(['Devolvente', m.descripcion, '', '', Number(m.monto)]));
+        addSheet('Cuadre ' + t.nombre, aoa, [30, 14, 3, 30, 14]);
       });
 
       Object.keys(porResp).forEach(n => {

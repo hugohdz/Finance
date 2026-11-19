@@ -339,3 +339,21 @@ dialog::backdrop { background: rgb(15 30 38 / 45%); }
 tr.row-bad td { background: color-mix(in srgb, var(--bad-bg) 45%, transparent); }
 tr.row-bad td:first-child { box-shadow: inset 3px 0 0 var(--meter-bad); padding-left: 10px; }
 .sidebar-foot b.diff-bad, .sidebar-foot b.diff-bad + span { color: var(--bad); }
+
+/* ---------- Cuadre en dos tablas ---------- */
+.estado-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 14px; margin: 6px 0 16px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md); font-size: 13px; }
+.estado-row form { display: flex; gap: 6px; }
+.estado-row input { width: 140px; text-align: right; }
+.estado-row > .num { margin-left: auto; }
+.cuadre-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.cuadre-col { border: 1px solid var(--line); border-radius: var(--radius-md); padding: 14px 16px; background: var(--paper); min-width: 0; }
+.cuadre-col tfoot td { font-size: 15px; }
+.bank-row td { background: var(--info-bg); color: var(--info); }
+.bank-row td:first-child { padding-left: 10px; box-shadow: inset 3px 0 0 var(--info); }
+.bank-row small { display: block; font-size: 11px; opacity: .85; margin-top: 2px; }
+button.link { border: 0; background: none; padding: 0; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+button.link:hover { color: var(--accent); text-decoration: underline; }
+.cuadre-result { margin-top: 14px; padding: 10px 14px; border-radius: var(--radius-md); font-weight: 600; font-size: 13px; text-align: center; }
+.cuadre-result.ok { color: var(--good); background: var(--good-bg); }
+.cuadre-result.bad { color: var(--bad); background: var(--bad-bg); }

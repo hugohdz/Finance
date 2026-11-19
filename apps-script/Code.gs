@@ -26,7 +26,7 @@ const SCHEMA = {
   EstadosCuenta: ['periodo', 'tarjeta', 'total', 'notas'],
   // Saldo a favor (p. ej. devolución de una compra a MSI) que se aplica mes con mes.
   Devolventes:   ['id', 'tarjeta', 'descripcion', 'responsable', 'categoria', 'monto_total', 'monto_mensual',
-                  'periodo_inicio', 'meses', 'notas', 'activo'],
+                  'periodo_inicio', 'meses', 'notas', 'activo', 'periodo_llegada'],
 };
 
 const ADMIN_ONLY = ['saveMovimiento', 'deleteMovimiento', 'importMovimientos', 'saveCatalogo',
@@ -359,6 +359,7 @@ const HANDLERS = {
     if (!(Number(d.monto_total) > 0) || !(Number(d.monto_mensual) > 0)) throw new Error('Montos inválidos');
     if (!/^\d{4}-\d{2}$/.test(String(d.periodo_inicio))) throw new Error('Periodo de inicio inválido');
     if (!(Number(d.meses) >= 1)) throw new Error('Meses inválidos');
+    if (d.periodo_llegada && !/^\d{4}-\d{2}$/.test(String(d.periodo_llegada))) throw new Error('Mes de llegada inválido');
     d.monto_total = round2_(d.monto_total);
     d.monto_mensual = round2_(d.monto_mensual);
     d.meses = Math.round(Number(d.meses));
