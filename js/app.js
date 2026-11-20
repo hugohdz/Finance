@@ -79,11 +79,33 @@
   }
   // Loader con contador (varias peticiones a la vez) y retraso corto para evitar parpadeos
   let loadingN = 0, loadingT = null;
-  function loading(on) {
+  function loading(on, inmediato) {
     loadingN = Math.max(0, loadingN + (on ? 1 : -1));
     clearTimeout(loadingT);
-    if (loadingN > 0) loadingT = setTimeout(() => { $('#loading').hidden = false; }, 120);
+    const show = () => { placeLoader(); $('#loading').hidden = false; };
+    if (loadingN > 0) { if (inmediato) show(); else loadingT = setTimeout(show, 120); }
     else $('#loading').hidden = true;
+  }
+  // Un <dialog> modal se pinta por encima de todo: si hay uno abierto, el loader vive dentro de él
+  function placeLoader() {
+    const el = $('#loading'), d = $('#modal');
+    const host = d && d.open ? d : document.body;
+    if (el.parentNode !== host) host.appendChild(el);
+  }
+  /** Ejecuta el guardado de un formulario una sola vez: bloquea botones y muestra el loader hasta terminar. */
+  async function guardando(form, fn) {
+    if (form.dataset.busy) return;
+    form.dataset.busy = '1';
+    const btns = $$('button, input[type=submit]', form);
+    const prev = btns.map(b => b.disabled);
+    btns.forEach(b => { b.disabled = true; });
+    loading(true, true);
+    try { await fn(); }
+    finally {
+      loading(false);
+      delete form.dataset.busy;
+      btns.forEach((b, i) => { b.disabled = prev[i]; });
+    }
   }
 
   /* ============================ API ============================ */
@@ -514,8 +536,10 @@
         categoria: f.categoria.value, monto_total: r2(f.monto_total.value), periodo_inicio: f.periodo_inicio.value,
         periodo_llegada: f.periodo_llegada.value && f.periodo_llegada.value > f.periodo_inicio.value ? f.periodo_llegada.value : '',
         meses: Number(f.meses.value), monto_mensual: r2(f.monto_mensual.value), notas: f.notas.value, activo: f.activo.checked };
-      try { await api('saveDevolvente', { devolvente: dev }); closeModal(); await refreshCatalogs(); await loadPeriodo(); toast('Devolvente guardado'); }
-      catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try { await api('saveDevolvente', { devolvente: dev }); closeModal(); await refreshCatalogs(); await loadPeriodo(); toast('Devolvente guardado'); }
+        catch (e) { toast(e.message); }
+      });
     });
   }
 
@@ -956,11 +980,13 @@
 
     $$('form[data-estado]', el).forEach(f => f.addEventListener('submit', async ev => {
       ev.preventDefault();
-      try {
-        await api('saveEstado', { periodo: S.periodo, tarjeta: f.dataset.estado, total: f.total.value === '' ? '' : Number(f.total.value) });
-        toast('Total del estado de cuenta guardado');
-        await loadPeriodo();
-      } catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try {
+          await api('saveEstado', { periodo: S.periodo, tarjeta: f.dataset.estado, total: f.total.value === '' ? '' : Number(f.total.value) });
+          toast('Total del estado de cuenta guardado');
+          await loadPeriodo();
+        } catch (e) { toast(e.message); }
+      });
     }));
   };
 
@@ -1039,10 +1065,12 @@
     $('#form-lim').addEventListener('submit', async ev => {
       ev.preventDefault();
       const f = ev.target;
-      try {
-        await api('saveLimite', { periodo: f.periodo.value, tarjeta: f.tarjeta.value, monto: Number(f.monto.value) });
-        await refreshCatalogs(); render(); toast('Límite guardado');
-      } catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try {
+          await api('saveLimite', { periodo: f.periodo.value, tarjeta: f.tarjeta.value, monto: Number(f.monto.value) });
+          await refreshCatalogs(); render(); toast('Límite guardado');
+        } catch (e) { toast(e.message); }
+      });
     });
     loadUsers();
   };
@@ -1051,10 +1079,12 @@
     $('#form-pwd').addEventListener('submit', async ev => {
       ev.preventDefault();
       const f = ev.target;
-      try {
-        await api('cambiarPassword', { actual: f.actual.value, nueva: f.nueva.value });
-        f.reset(); toast('Contraseña actualizada');
-      } catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try {
+          await api('cambiarPassword', { actual: f.actual.value, nueva: f.nueva.value });
+          f.reset(); toast('Contraseña actualizada');
+        } catch (e) { toast(e.message); }
+      });
     });
   }
 
@@ -1078,7 +1108,7 @@
     const d = $('#modal');
     if (!d.open) d.showModal();
   }
-  function closeModal() { $('#modal').close(); }
+  function closeModal() { $('#modal').close(); placeLoader(); }
 
   function catalogModal(tipo, item) {
     item = item || { activo: true };
@@ -1097,8 +1127,10 @@
       const it = { id: item.id, nombre: f.nombre.value.trim(), activo: f.activo.checked };
       if (f.tipo) it.tipo = f.tipo.value;
       if (f.dia_corte) it.dia_corte = f.tipo.value === 'credito' && f.dia_corte.value ? Number(f.dia_corte.value) : '';
-      try { await api('saveCatalogo', { tipo: tipo, item: it }); closeModal(); await refreshCatalogs(); render(); toast('Guardado'); }
-      catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try { await api('saveCatalogo', { tipo: tipo, item: it }); closeModal(); await refreshCatalogs(); render(); toast('Guardado'); }
+        catch (e) { toast(e.message); }
+      });
     });
   }
 
@@ -1117,10 +1149,12 @@
     $('#form-user').addEventListener('submit', async ev => {
       ev.preventDefault();
       const f = ev.target;
-      try {
-        await api('saveUsuario', { user: { usuario: f.usuario.value, password: f.password.value, rol: f.rol.value, responsable: f.responsable.value, activo: f.activo.checked } });
-        closeModal(); loadUsers(); toast('Usuario guardado');
-      } catch (e) { toast(e.message); }
+      guardando(f, async () => {
+        try {
+          await api('saveUsuario', { user: { usuario: f.usuario.value, password: f.password.value, rol: f.rol.value, responsable: f.responsable.value, activo: f.activo.checked } });
+          closeModal(); loadUsers(); toast('Usuario guardado');
+        } catch (e) { toast(e.message); }
+      });
     });
   }
 
@@ -1270,8 +1304,9 @@
     drawSplits();
     syncPeriodo();
 
-    form.addEventListener('submit', async ev => {
+    form.addEventListener('submit', ev => {
       ev.preventDefault();
+      if (form.dataset.busy) return;
       syncPeriodo();
       const asign = splits.filter(s => s.responsable && Number(s.monto));
       const tot = r2(asign.reduce((s, x) => s + Number(x.monto), 0));
@@ -1282,15 +1317,19 @@
         msi_actual: form.msi_actual.value, msi_total: form.msi_total.value,
         ref_id: form.tipo.value === 'devolucion' ? form.ref_id.value : '', notas: form.notas.value,
       };
-      try {
-        await api('saveMovimiento', { movimiento: mov, asignaciones: asign.map(s => ({ responsable: s.responsable, monto: Number(s.monto), concepto: s.concepto })) });
-        closeModal(); toast('Guardado');
-        const otroPeriodo = mov.periodo !== S.periodo;
-        if (otroPeriodo) { S.periodo = mov.periodo; toast('Guardado en ' + periodLabel(mov.periodo)); }
-        await refreshCatalogs();
-        await loadPeriodo();
-        if (mov.tipo === 'cargo') avisoTrasGuardar(isNew ? 'Nuevo gasto' : 'Gasto actualizado');
-      } catch (e) { toast(e.message); }
+      return guardando(form, async () => {
+        let ok = false;
+        try {
+          await api('saveMovimiento', { movimiento: mov, asignaciones: asign.map(s => ({ responsable: s.responsable, monto: Number(s.monto), concepto: s.concepto })) });
+          ok = true;
+          closeModal(); toast('Guardado');
+          const otroPeriodo = mov.periodo !== S.periodo;
+          if (otroPeriodo) { S.periodo = mov.periodo; toast('Guardado en ' + periodLabel(mov.periodo)); }
+          await refreshCatalogs();
+          await loadPeriodo();
+        } catch (e) { toast(e.message); }
+        if (ok && mov.tipo === 'cargo') avisoTrasGuardar(isNew ? 'Nuevo gasto' : 'Gasto actualizado');
+      });
     });
   }
 
@@ -1485,7 +1524,13 @@
     };
     $('#imp-bulk-cat').onchange = e => { rows.filter(r => r.include).forEach(r => { r.categoria = e.target.value; }); drawImport(); };
     $('#imp-cancel').onclick = () => { S.importRows = null; S.importMeta = null; render(); };
-    $('#imp-go').onclick = async () => {
+    $('#imp-go').onclick = async ev => {
+      const btn = ev.currentTarget;
+      if (btn.dataset.busy) return;
+      btn.dataset.busy = '1'; btn.disabled = true; loading(true, true);
+      try { await importar(); } finally { loading(false); delete btn.dataset.busy; btn.disabled = false; }
+    };
+    const importar = async () => {
       const items = rows.filter(r => r.include).map(r => {
         const msi = parseMSI(r.descripcion);
         return {
