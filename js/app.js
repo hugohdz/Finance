@@ -143,7 +143,8 @@
   function pendiente(m) { return r2(Number(m.monto) - asignado(m)); }
   function tarjetaTipo(nombre) {
     const t = S.cat.tarjetas.find(x => x.nombre === nombre);
-    return t ? t.tipo : '';
+    if (!t) return '';
+    return /^d[eé]bito$/i.test(String(t.tipo).trim()) ? 'debito' : /^cr[eé]dito$/i.test(String(t.tipo).trim()) ? 'credito' : t.tipo;
   }
   function movsFiltradas() {
     return S.data.movimientos
@@ -888,15 +889,23 @@
       el.innerHTML = `
         ${pageHead('Por responsable · ' + periodoTitulo(), 'Total a pagar', names.length + ' responsables · ' + fmt(totalMovs), backBtn() + selector)}
         <div class="card table-wrap">
-          <table><thead><tr><th>Responsable</th><th class="num">Cargos</th><th class="num">Devoluciones</th><th class="num">Total a pagar</th><th></th></tr></thead>
+          <table><thead><tr><th>Responsable</th><th class="num">Crédito</th><th class="num">Débito</th><th class="num">Devoluciones</th><th class="num">Total a pagar</th><th></th></tr></thead>
           <tbody>${names.map(n => {
             const rs = respResumen(n, ids);
-            return `<tr><td><span class="user-chip"><span class="avatar">${esc(n.charAt(0))}</span>${esc(n)}</span></td><td class="num">${fmt(rs.cargos)}</td><td class="num neg">${rs.devs ? '−' + fmt(rs.devs) : ''}</td>
-              <td class="num"><b>${fmt(totals[n])}</b></td><td class="num"><button class="btn small" data-act="resp-focus" data-key="${esc(n)}">Ver cargos ›</button></td></tr>`;
+            let deb = 0;
+            S.data.asignaciones.forEach(a => {
+              const m = a.responsable === n && ids[a.movimiento_id];
+              if (m && m.tipo !== 'devolucion' && tarjetaTipo(m.tarjeta) === 'debito') deb += Number(a.monto);
+            });
+            deb = r2(deb);
+            const lim = limiteResp(n);
+            const over = lim && totals[n] > lim;
+            return `<tr class="${over ? 'row-bad' : ''}"><td><span class="user-chip"><span class="avatar">${esc(n.charAt(0))}</span>${esc(n)}</span></td><td class="num">${fmt(r2(rs.cargos - deb))}</td><td class="num">${deb ? fmt(deb) : '<span class="muted">—</span>'}</td><td class="num neg">${rs.devs ? '−' + fmt(rs.devs) : ''}</td>
+              <td class="num"><b>${fmt(totals[n])}</b>${over ? `<br><span class="badge bad">✕ Excede ${fmt(totals[n] - lim)}</span>` : ''}</td><td class="num"><button class="btn small" data-act="resp-focus" data-key="${esc(n)}">Ver cargos ›</button></td></tr>`;
           }).join('')}
-          ${sinAsignar ? `<tr><td><span class="badge warn">! Sin asignar</span></td><td></td><td></td><td class="num">${fmt(sinAsignar)}</td><td class="num"><button class="btn small" data-act="drill" data-kind="resp" data-key="(Sin asignar)">Asignar ›</button></td></tr>` : ''}
+          ${sinAsignar ? `<tr><td><span class="badge warn">! Sin asignar</span></td><td></td><td></td><td></td><td class="num">${fmt(sinAsignar)}</td><td class="num"><button class="btn small" data-act="drill" data-kind="resp" data-key="(Sin asignar)">Asignar ›</button></td></tr>` : ''}
           </tbody>
-          <tfoot><tr><td>Total</td><td></td><td></td><td class="num">${fmt(totalMovs)}</td><td></td></tr></tfoot></table></div>
+          <tfoot><tr><td>Total</td><td></td><td></td><td></td><td class="num">${fmt(totalMovs)}</td><td></td></tr></tfoot></table></div>
         <div class="grid cols-2">${names.map(n => detalleResponsable(n, ids)).join('')}</div>`;
     }
     $('#resp-sel').addEventListener('change', e => { S.respFocus = e.target.value; render(); });
@@ -937,20 +946,26 @@
       </div>
       <div class="card panel"><div class="card-head"><h3>Gasto por categoría</h3><span class="meta">${Object.keys(porCat).length} categorías${mine ? ' · clic para filtrar' : ''}</span></div>${barList(porCat, { total: t.total, kind: mine ? 'cat' : undefined })}</div>
       ${catFilter ? `<div class="crumbs"><span class="filter-pill">Categoría: ${esc(catFilter === '__none' ? '(Sin categoría)' : catFilter)}<button type="button" data-act="mis-cat" aria-label="Quitar filtro">✕</button></span></div>` : ''}
-      ${detalleResponsable(n, ids, true, catFilter, true)}
+      ${detalleResponsable(n, ids, true, catFilter, true, 'credito')}
+      ${detalleResponsable(n, ids, true, catFilter, true, 'debito')}
       ${S.tarjeta !== '*' ? '<p class="muted">Esta vista incluye todas las tarjetas del responsable (crédito y débito).</p>' : ''}`;
   }
 
   /** Tabla de cargos de un responsable. full = columnas completas (vista enfocada). */
-  function detalleResponsable(n, ids, full, catFilter, conTarjeta) {
+  function detalleResponsable(n, ids, full, catFilter, conTarjeta, tipoTarjeta) {
     let items = S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id])
       .map(a => ({ a: a, m: ids[a.movimiento_id] }))
       .sort((x, y) => String(y.m.fecha).localeCompare(String(x.m.fecha)));
     if (catFilter) items = items.filter(x => catFilter === '__none' ? !x.m.categoria : x.m.categoria === catFilter);
+    if (tipoTarjeta) items = items.filter(x => (tarjetaTipo(x.m.tarjeta) === 'debito') === (tipoTarjeta === 'debito'));
     const sg = x => (x.m.tipo === 'devolucion' ? -1 : 1);
     const tot = r2(items.reduce((s, x) => s + sg(x) * Number(x.a.monto), 0));
+    const titulo = tipoTarjeta === 'debito' ? 'Movimientos de tarjeta de débito' : tipoTarjeta ? 'Movimientos de tarjeta de crédito' : 'Detalle de cargos';
+    if (full && tipoTarjeta && !items.length) {
+      return `<div class="card"><div class="card-head"><h3>${titulo}</h3><span class="meta">0 · ${fmt(0)}</span></div><div class="empty">Sin movimientos ${tipoTarjeta === 'debito' ? 'de débito' : 'de crédito'} en ${periodLabel(S.periodo)}${catFilter ? ' para esta categoría' : ''}.</div></div>`;
+    }
     const head = full
-      ? `<div class="card-head"><h3>Detalle de cargos</h3><span class="meta">${items.length} · ${fmt(tot)}</span></div>`
+      ? `<div class="card-head"><h3>${titulo}</h3><span class="meta">${items.length} · ${fmt(tot)}</span></div>`
       : `<div class="card-head"><h3><button class="btn small ghost" style="padding-left:0" data-act="resp-focus" data-key="${esc(n)}">${esc(n)} ›</button></h3><span class="meta">${fmt(tot)}</span></div>`;
     return `<div class="card table-wrap">${head}<table>
       ${full ? `<thead><tr><th>Fecha</th><th>Concepto</th><th>Categoría</th>${conTarjeta ? '<th>Tarjeta</th>' : ''}<th class="num">Cargo total</th><th class="num">Le toca</th></tr></thead>` : ''}
@@ -960,7 +975,7 @@
         : esc(x.m.categoria) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' ? ' · ' + esc(x.m.tarjeta) : '')}</small></td>
       ${full ? `<td>${x.m.categoria ? `<span class="tag">${esc(x.m.categoria)}</span>` : ''}</td>${conTarjeta ? `<td><span class="tag">${tarjetaTipo(x.m.tarjeta) === 'debito' ? 'Débito' : 'Crédito'}</span> <small class="muted">${esc(x.m.tarjeta)}</small></td>` : ''}<td class="num muted">${fmt(sg(x) * x.m.monto)}</td>` : ''}
       <td class="num ${x.m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(sg(x) * x.a.monto)}</td></tr>`).join('')}
-      </tbody>${full ? `<tfoot><tr><td colspan="${conTarjeta ? 5 : 4}">Total a pagar</td><td class="num">${fmt(tot)}</td></tr></tfoot>` : ''}</table></div>`;
+      </tbody>${full ? `<tfoot><tr><td colspan="${conTarjeta ? 5 : 4}">${tipoTarjeta === 'debito' ? 'Total débito' : tipoTarjeta ? 'Total crédito' : 'Total a pagar'}</td><td class="num">${fmt(tot)}</td></tr></tfoot>` : ''}</table></div>`;
   }
 
   function cuadreData(tarjeta) {
