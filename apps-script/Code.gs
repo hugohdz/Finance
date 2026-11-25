@@ -22,7 +22,7 @@ const SCHEMA = {
   Movimientos:   ['id', 'periodo', 'tarjeta', 'fecha', 'descripcion', 'monto', 'tipo', 'categoria',
                   'msi_actual', 'msi_total', 'ref_id', 'notas', 'creado_por', 'actualizado'],
   Asignaciones:  ['id', 'movimiento_id', 'responsable', 'monto', 'concepto'],
-  Limites:       ['periodo', 'tarjeta', 'monto'],
+  Limites:       ['periodo', 'tarjeta', 'monto', 'responsable'],
   EstadosCuenta: ['periodo', 'tarjeta', 'total', 'notas'],
   // Saldo a favor (p. ej. devolución de una compra a MSI) que se aplica mes con mes.
   Devolventes:   ['id', 'tarjeta', 'descripcion', 'responsable', 'categoria', 'monto_total', 'monto_mensual',
@@ -330,13 +330,16 @@ const HANDLERS = {
     return item;
   },
 
-  /** periodo '*' = límite por defecto; tarjeta '*' = todas las tarjetas. monto vacío = eliminar. */
+  /** periodo '*' = límite por defecto; tarjeta '*' = todas las tarjetas; responsable = límite de esa persona
+   *  (todas sus tarjetas). monto vacío = eliminar. */
   saveLimite: function (req) {
     const periodo = String(req.periodo || '*');
     const tarjeta = String(req.tarjeta || '*');
-    const rows = readTable_('Limites').filter(l => !(String(l.periodo) === periodo && String(l.tarjeta) === tarjeta));
+    const responsable = String(req.responsable || '');
+    const rows = readTable_('Limites').filter(l => !(String(l.periodo) === periodo && String(l.tarjeta) === tarjeta
+      && String(l.responsable || '') === responsable));
     if (req.monto !== '' && req.monto !== null && req.monto !== undefined) {
-      rows.push({ periodo: periodo, tarjeta: tarjeta, monto: round2_(req.monto) });
+      rows.push({ periodo: periodo, tarjeta: tarjeta, monto: round2_(req.monto), responsable: responsable });
     }
     writeTable_('Limites', rows);
     return rows;

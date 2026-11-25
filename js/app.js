@@ -446,7 +446,7 @@
         notas: 'Saldo restante ' + fmt(sal.saldo), msi_actual: '', msi_total: '',
       });
       S.data.asignaciones.push({ id: id, virtual: true, movimiento_id: id, responsable: d.responsable, monto: a.monto,
-        concepto: 'Devolvente ' + d.descripcion + ' (' + a.k + '/' + d.meses + ')' });
+        concepto: (/^devolvente/i.test(d.descripcion) ? '' : 'Devolvente ') + d.descripcion + ' (' + a.k + '/' + d.meses + ')' });
     });
   }
 
@@ -548,9 +548,31 @@
   /** Límite aplicable a una tarjeta ('*' = todas) en el periodo cargado. */
   function limiteFor(tarjeta) {
     const L = S.cat.limites;
-    const find = (p, c) => L.find(l => String(l.periodo) === p && String(l.tarjeta) === c);
+    const find = (p, c) => L.find(l => String(l.periodo) === p && String(l.tarjeta) === c && !l.responsable);
     const hit = find(S.periodo, tarjeta) || find('*', tarjeta);
     return hit ? Number(hit.monto) : null;
+  }
+  /** Límite mensual de un responsable (suma de todas sus tarjetas). */
+  function limiteResp(resp) {
+    const L = S.cat.limites;
+    const find = p => L.find(l => String(l.periodo) === p && String(l.responsable || '') === resp);
+    const hit = find(S.periodo) || find('*');
+    return hit ? Number(hit.monto) : null;
+  }
+  /** Totales de un responsable en el periodo, en todas las tarjetas: crédito, débito, devoluciones. */
+  function respTotales(n) {
+    const ids = {};
+    S.data.movimientos.forEach(m => { ids[m.id] = m; });
+    const t = { credito: 0, debito: 0, devs: 0, nCred: 0, nDeb: 0, devItems: [] };
+    S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id]).forEach(a => {
+      const m = ids[a.movimiento_id], v = Number(a.monto);
+      if (m.tipo === 'devolucion') { t.devs += v; t.devItems.push({ a: a, m: m }); }
+      else if (tarjetaTipo(m.tarjeta) === 'debito') { t.debito += v; t.nDeb++; }
+      else { t.credito += v; t.nCred++; }
+    });
+    t.credito = r2(t.credito); t.debito = r2(t.debito); t.devs = r2(t.devs);
+    t.total = r2(t.credito + t.debito - t.devs);
+    return t;
   }
 
   /** Revisa límite, gastos sin asignar y cuadre de TODO el periodo cargado. */
@@ -570,6 +592,14 @@
         text: `Se rebasó ${nombre} (${fmt(lim)}) por <b>${fmt(total - lim)}</b>. Gasto actual ${fmt(total)}.` });
       else if (st.cls === 'warn') out.push({ level: 'warn', tipo: 'limite', act: 'alert-go', tab: 'resumen', tarjeta: t,
         text: `Vas al ${st.pct.toFixed(0)}% ${t === '*' ? 'del límite mensual' : 'del límite de ' + esc(t)}: quedan <b>${fmt(lim - total)}</b>.` });
+    });
+
+    S.cat.responsables.forEach(r => {
+      const lim = limiteResp(r.nombre);
+      if (!lim) return;
+      const total = respTotales(r.nombre).total;
+      if (total > lim) out.push({ level: 'bad', tipo: 'limite-resp', act: 'alert-go', tab: 'responsables', resp: r.nombre,
+        text: `${esc(r.nombre)} rebasó su límite (${fmt(lim)}) por <b>${fmt(total - lim)}</b>. Gastó ${fmt(total)}.` });
     });
 
     S.cat.tarjetas.forEach(t => {
@@ -621,6 +651,7 @@
     }
     if (a.tarjeta && a.tarjeta !== '*' && a.tab === 'cuadre') { S.tarjeta = a.tarjeta; $('#f-tarjeta').value = a.tarjeta; }
     if (a.tipo === 'limite') { S.tarjeta = a.tarjeta; $('#f-tarjeta').value = a.tarjeta; }
+    if (a.tipo === 'limite-resp') { S.respFocus = a.resp; S.tarjeta = '*'; $('#f-tarjeta').value = '*'; }
     go(a.tab);
   }
 
@@ -847,24 +878,12 @@
     const selector = `<select id="resp-sel" aria-label="Responsable"><option value="">Todos los responsables</option>${S.cat.responsables.map(r => `<option ${r.nombre === focus ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('')}</select>`;
 
     if (focus) {
-      const rs = respResumen(focus, ids);
-      const porCat = {};
-      S.data.asignaciones.filter(a => a.responsable === focus && ids[a.movimiento_id]).forEach(a => {
-        const m = ids[a.movimiento_id];
-        const k = m.categoria || '(Sin categoría)';
-        porCat[k] = r2((porCat[k] || 0) + (m.tipo === 'devolucion' ? -1 : 1) * Number(a.monto));
-      });
+      const movIds = {};
+      S.data.movimientos.forEach(m => { movIds[m.id] = 1; });
+      const nCargos = S.data.asignaciones.filter(a => a.responsable === focus && movIds[a.movimiento_id]).length;
       el.innerHTML = `
-        ${pageHead('Cargos del responsable · ' + periodoTitulo(), esc(focus), rs.count + ' cargos', backBtn() + selector)}
-        <div class="grid cols-4">
-          ${statCard('Total a pagar', fmt(rs.total), totalMovs ? (rs.total / totalMovs * 100).toFixed(1) + '% del gasto del periodo' : '')}
-          ${statCard('Cargos', fmt(rs.cargos), rs.count + ' movimientos')}
-          ${statCard('Devoluciones', fmt(rs.devs), rs.devs ? 'A su favor' : 'Sin devoluciones')}
-        </div>
-        <div class="grid cols-2" style="grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr)">
-          ${detalleResponsable(focus, ids, true)}
-          <div class="card panel"><div class="card-head"><h3>Por categoría</h3></div>${barList(porCat, { total: rs.total })}</div>
-        </div>`;
+        ${pageHead('Cargos del responsable · ' + periodLabel(S.periodo), esc(focus), nCargos + ' cargos · todas las tarjetas', backBtn() + selector)}
+        ${respPanel(focus)}`;
     } else {
       el.innerHTML = `
         ${pageHead('Por responsable · ' + periodoTitulo(), 'Total a pagar', names.length + ' responsables · ' + fmt(totalMovs), backBtn() + selector)}
@@ -883,8 +902,47 @@
     $('#resp-sel').addEventListener('change', e => { S.respFocus = e.target.value; render(); });
   };
 
+  /**
+   * Vista de un responsable, en este orden: total gastado (crédito + débito) contra su límite,
+   * crédito y débito, devoluciones, gasto por categoría y detalle de cargos. Incluye todas las tarjetas.
+   */
+  function respPanel(n, catFilter, mine) {
+    const ids = {};
+    S.data.movimientos.forEach(m => { ids[m.id] = m; });
+    const t = respTotales(n);
+    const lim = limiteResp(n);
+    const st = limiteStatus(t.total, lim);
+    const color = st.cls === 'bad' ? 'var(--meter-bad)' : st.cls === 'warn' ? 'var(--meter-warn)' : 'var(--meter-good)';
+    const limTxt = !lim ? `<span class="badge neutral">Sin límite definido</span>${isAdmin() ? '<button class="btn small ghost" data-tab="config">Definir límite ›</button>' : ''}`
+      : st.cls === 'bad' ? `<span>Límite ${fmt(lim)} · ${st.pct.toFixed(0)}% usado</span>`
+      : `<span class="badge ${st.cls}">${st.text}</span><span>Límite ${fmt(lim)} · ${st.pct.toFixed(0)}% usado</span>`;
+    const meter = lim ? `<div class="meter" role="meter" aria-valuenow="${st.pct.toFixed(0)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.min(100, st.pct)}%;background:${color}"></span></div>` : '';
+    const hero = `<div class="card stat resp-hero${st.cls === 'bad' ? ' alert-bad' : st.cls === 'warn' ? ' alert-warn' : ''}">
+        <div class="label">Total gastado · crédito + débito${t.devs ? ' − devoluciones' : ''}</div>
+        <div class="value">${fmt(t.total)}</div>
+        ${st.cls === 'bad' ? `<div class="over">Excedido por <b>${fmt(t.total - lim)}</b></div>` : ''}
+        <div class="sub">${limTxt}</div>${meter}</div>`;
+    const devList = t.devItems.length ? `<ul class="mini-list">${t.devItems.map(x => `<li><span>${esc(x.a.concepto || x.m.descripcion)}</span><span class="num neg">−${fmt(x.a.monto)}</span></li>`).join('')}</ul>` : '';
+    const porCat = {};
+    S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id]).forEach(a => {
+      const m = ids[a.movimiento_id];
+      const k = m.categoria || '(Sin categoría)';
+      porCat[k] = r2((porCat[k] || 0) + (m.tipo === 'devolucion' ? -1 : 1) * Number(a.monto));
+    });
+    return `${hero}
+      <div class="grid cols-3">
+        ${statCard('Tarjeta de crédito', fmt(t.credito), t.nCred + ' cargo' + (t.nCred === 1 ? '' : 's'))}
+        ${statCard('Tarjeta de débito', fmt(t.debito), t.nDeb ? t.nDeb + ' cargo' + (t.nDeb === 1 ? '' : 's') : 'Sin cargos')}
+        ${statCard('Devoluciones', t.devs ? '−' + fmt(t.devs) : fmt(0), t.devs ? (mine ? 'A tu favor' : 'A su favor') + ' · ya descontadas del total' : 'Sin devoluciones', devList)}
+      </div>
+      <div class="card panel"><div class="card-head"><h3>Gasto por categoría</h3><span class="meta">${Object.keys(porCat).length} categorías${mine ? ' · clic para filtrar' : ''}</span></div>${barList(porCat, { total: t.total, kind: mine ? 'cat' : undefined })}</div>
+      ${catFilter ? `<div class="crumbs"><span class="filter-pill">Categoría: ${esc(catFilter === '__none' ? '(Sin categoría)' : catFilter)}<button type="button" data-act="mis-cat" aria-label="Quitar filtro">✕</button></span></div>` : ''}
+      ${detalleResponsable(n, ids, true, catFilter, true)}
+      ${S.tarjeta !== '*' ? '<p class="muted">Esta vista incluye todas las tarjetas del responsable (crédito y débito).</p>' : ''}`;
+  }
+
   /** Tabla de cargos de un responsable. full = columnas completas (vista enfocada). */
-  function detalleResponsable(n, ids, full, catFilter) {
+  function detalleResponsable(n, ids, full, catFilter, conTarjeta) {
     let items = S.data.asignaciones.filter(a => a.responsable === n && ids[a.movimiento_id])
       .map(a => ({ a: a, m: ids[a.movimiento_id] }))
       .sort((x, y) => String(y.m.fecha).localeCompare(String(x.m.fecha)));
@@ -895,14 +953,14 @@
       ? `<div class="card-head"><h3>Detalle de cargos</h3><span class="meta">${items.length} · ${fmt(tot)}</span></div>`
       : `<div class="card-head"><h3><button class="btn small ghost" style="padding-left:0" data-act="resp-focus" data-key="${esc(n)}">${esc(n)} ›</button></h3><span class="meta">${fmt(tot)}</span></div>`;
     return `<div class="card table-wrap">${head}<table>
-      ${full ? `<thead><tr><th>Fecha</th><th>Concepto</th><th>Categoría</th><th class="num">Cargo total</th><th class="num">Le toca</th></tr></thead>` : ''}
+      ${full ? `<thead><tr><th>Fecha</th><th>Concepto</th><th>Categoría</th>${conTarjeta ? '<th>Tarjeta</th>' : ''}<th class="num">Cargo total</th><th class="num">Le toca</th></tr></thead>` : ''}
       <tbody>${items.map(x => `
       <tr><td>${fmtDate(x.m.fecha)}</td>
-      <td class="desc">${esc(x.a.concepto || x.m.descripcion)}<small>${full ? esc(x.m.descripcion) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' ? ' · ' + esc(x.m.tarjeta) : '')
+      <td class="desc">${esc(x.a.concepto || x.m.descripcion)}<small>${full ? esc(x.m.descripcion) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' && !conTarjeta ? ' · ' + esc(x.m.tarjeta) : '')
         : esc(x.m.categoria) + (x.m.msi_total ? ' · MSI ' + x.m.msi_actual + '/' + x.m.msi_total : '') + (S.tarjeta === '*' ? ' · ' + esc(x.m.tarjeta) : '')}</small></td>
-      ${full ? `<td>${x.m.categoria ? `<span class="tag">${esc(x.m.categoria)}</span>` : ''}</td><td class="num muted">${fmt(sg(x) * x.m.monto)}</td>` : ''}
+      ${full ? `<td>${x.m.categoria ? `<span class="tag">${esc(x.m.categoria)}</span>` : ''}</td>${conTarjeta ? `<td><span class="tag">${tarjetaTipo(x.m.tarjeta) === 'debito' ? 'Débito' : 'Crédito'}</span> <small class="muted">${esc(x.m.tarjeta)}</small></td>` : ''}<td class="num muted">${fmt(sg(x) * x.m.monto)}</td>` : ''}
       <td class="num ${x.m.tipo === 'devolucion' ? 'neg' : ''}">${fmt(sg(x) * x.a.monto)}</td></tr>`).join('')}
-      </tbody>${full ? `<tfoot><tr><td colspan="4">Total a pagar</td><td class="num">${fmt(tot)}</td></tr></tfoot>` : ''}</table></div>`;
+      </tbody>${full ? `<tfoot><tr><td colspan="${conTarjeta ? 5 : 4}">Total a pagar</td><td class="num">${fmt(tot)}</td></tr></tfoot>` : ''}</table></div>`;
   }
 
   function cuadreData(tarjeta) {
@@ -998,24 +1056,9 @@
     movs.forEach(m => { ids[m.id] = m; });
     const me = S.session.responsable;
     const rs = respResumen(me, ids);
-    const porCat = {};
-    S.data.asignaciones.filter(a => ids[a.movimiento_id]).forEach(a => {
-      const m = ids[a.movimiento_id];
-      const k = m.categoria || '(Sin categoría)';
-      porCat[k] = r2((porCat[k] || 0) + (m.tipo === 'devolucion' ? -1 : 1) * Number(a.monto));
-    });
-    const catName = S.misCat === '__none' ? '(Sin categoría)' : S.misCat;
     el.innerHTML = `
-      ${pageHead('Mis cargos · ' + periodoTitulo(), 'Hola ' + esc(me), rs.count + ' cargos')}
-      <div class="grid cols-4">
-        ${statCard('Total a pagar', fmt(rs.total), rs.count + ' cargos' + (S.tarjeta !== '*' ? ' en ' + esc(S.tarjeta) : ''))}
-        ${statCard('Devoluciones', fmt(rs.devs), rs.devs ? 'A tu favor' : 'Sin devoluciones')}
-      </div>
-      ${S.misCat ? `<div class="crumbs"><span class="filter-pill">Categoría: ${esc(catName)}<button type="button" data-act="mis-cat" aria-label="Quitar filtro">✕</button></span></div>` : ''}
-      <div class="grid cols-2" style="grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr)">
-        ${detalleResponsable(me, ids, true, S.misCat)}
-        <div class="card panel"><div class="card-head"><h3>Por categoría</h3><span class="meta">clic para filtrar</span></div>${barList(porCat, { total: rs.total, kind: 'cat' })}</div>
-      </div>
+      ${pageHead('Mis cargos · ' + periodLabel(S.periodo), 'Hola ' + esc(me), rs.count + ' cargos')}
+      ${respPanel(me, S.misCat, true)}
       <div class="card panel" id="historial-card"><h3>Mi historial</h3><div class="muted">Cargando…</div></div>`;
     renderHistorial($('#historial-card'));
   };
@@ -1042,13 +1085,14 @@
     el.innerHTML = `
       ${pageHead('Configuración', 'Catálogos y accesos', 'Límites · tarjetas · responsables · usuarios')}
       <div class="card table-wrap"><h3>Límites de gasto mensual</h3>
-        <p class="muted">El límite de un periodo específico tiene prioridad sobre el límite general ("Todos los periodos"). "Todas" aplica al gasto conjunto de todas las tarjetas.</p>
-        <table><thead><tr><th>Periodo</th><th>Tarjeta</th><th class="num">Límite</th><th></th></tr></thead><tbody>
-        ${limRows.map(l => `<tr><td>${periodLabel(String(l.periodo))}</td><td>${l.tarjeta === '*' ? 'Todas' : esc(l.tarjeta)}</td><td class="num">${fmt(l.monto)}</td>
-          <td class="num"><button class="btn small ghost danger" data-act="lim-del" data-p="${esc(l.periodo)}" data-t="${esc(l.tarjeta)}">✕</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">Sin límites</td></tr>'}
+        <p class="muted">El límite de un periodo específico tiene prioridad sobre el límite general ("Todos los periodos"). "Todas" aplica al gasto conjunto de todas las tarjetas. El límite de un responsable se compara con lo que gastó en todas sus tarjetas (crédito + débito).</p>
+        <table><thead><tr><th>Periodo</th><th>Aplica a</th><th class="num">Límite</th><th></th></tr></thead><tbody>
+        ${limRows.map(l => `<tr><td>${periodLabel(String(l.periodo))}</td><td>${l.responsable ? 'Responsable · ' + esc(l.responsable) : l.tarjeta === '*' ? 'Todas las tarjetas' : 'Tarjeta · ' + esc(l.tarjeta)}</td><td class="num">${fmt(l.monto)}</td>
+          <td class="num"><button class="btn small ghost danger" data-act="lim-del" data-p="${esc(l.periodo)}" data-t="${esc(l.tarjeta)}" data-r="${esc(l.responsable || '')}">✕</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">Sin límites</td></tr>'}
         </tbody></table>
         <form id="form-lim" class="form-grid" style="margin-top:.8rem">
           <label>Periodo <select name="periodo"><option value="*">Todos los periodos</option><option value="${S.periodo}">${periodLabel(S.periodo)}</option></select></label>
+          <label>Responsable <select name="responsable"><option value="">— (límite de tarjeta)</option>${S.cat.responsables.map(r => `<option>${esc(r.nombre)}</option>`).join('')}</select></label>
           <label>Tarjeta <select name="tarjeta"><option value="*">Todas</option>${S.cat.tarjetas.map(t => `<option>${esc(t.nombre)}</option>`).join('')}</select></label>
           <label>Límite (MXN) <input type="number" step="0.01" min="0" name="monto" required></label>
           <div style="align-self:end"><button class="btn primary">Guardar límite</button></div>
@@ -1062,12 +1106,17 @@
       ${pwd}`;
     bindPwd();
 
+    $('#form-lim').responsable.addEventListener('change', e => {
+      const t = $('#form-lim').tarjeta;
+      t.disabled = !!e.target.value;
+      if (e.target.value) t.value = '*';
+    });
     $('#form-lim').addEventListener('submit', async ev => {
       ev.preventDefault();
       const f = ev.target;
       guardando(f, async () => {
         try {
-          await api('saveLimite', { periodo: f.periodo.value, tarjeta: f.tarjeta.value, monto: Number(f.monto.value) });
+          await api('saveLimite', { periodo: f.periodo.value, tarjeta: f.responsable.value ? '*' : f.tarjeta.value, responsable: f.responsable.value, monto: Number(f.monto.value) });
           await refreshCatalogs(); render(); toast('Límite guardado');
         } catch (e) { toast(e.message); }
       });
@@ -1667,7 +1716,7 @@
     if (act === 'cat-new') catalogModal(t.dataset.tipo);
     if (act === 'cat-edit') catalogModal(t.dataset.tipo, S.cat[t.dataset.tipo.toLowerCase()].find(x => x.id === t.dataset.id));
     if (act === 'lim-del') {
-      try { await api('saveLimite', { periodo: t.dataset.p, tarjeta: t.dataset.t, monto: '' }); await refreshCatalogs(); render(); } catch (err) { toast(err.message); }
+      try { await api('saveLimite', { periodo: t.dataset.p, tarjeta: t.dataset.t, responsable: t.dataset.r || '', monto: '' }); await refreshCatalogs(); render(); } catch (err) { toast(err.message); }
     }
     if (act === 'user-new') userModal(null);
     if (act === 'user-edit') userModal((S.users || []).find(u => u.usuario === t.dataset.u));

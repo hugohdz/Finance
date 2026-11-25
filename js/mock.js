@@ -107,8 +107,9 @@
       return it;
     },
     saveLimite(db, req) {
-      db.Limites = db.Limites.filter(l => !(l.periodo === req.periodo && l.tarjeta === req.tarjeta));
-      if (req.monto !== '' && req.monto !== null) db.Limites.push({ periodo: req.periodo, tarjeta: req.tarjeta, monto: r2(req.monto) });
+      const resp = req.responsable || '';
+      db.Limites = db.Limites.filter(l => !(l.periodo === req.periodo && l.tarjeta === req.tarjeta && (l.responsable || '') === resp));
+      if (req.monto !== '' && req.monto !== null) db.Limites.push({ periodo: req.periodo, tarjeta: req.tarjeta, monto: r2(req.monto), responsable: resp });
       return db.Limites;
     },
     saveEstado(db, req) {
